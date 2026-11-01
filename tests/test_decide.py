@@ -28,8 +28,10 @@ def answer(choice, confidence=0.95, **others):
 class FakeJev:
     """Scripted answers: `op`, `target` and `input` may be plain labels or Answer objects."""
 
-    def __init__(self, op="CLICK", target="1", input="budget_name", scores=None):
+    def __init__(self, op="CLICK", target="1", input="budget_name", scores=None, noul=0.1):
         self.script = {"op": op, "target": target, "input": input}
+        self.noul_value = noul
+        self.nouls = []
         self.scores = scores or {}
         self.model = "fake"
         self.requests = []
@@ -46,6 +48,10 @@ class FakeJev:
             value = self.script[key]
             answers[name] = value if isinstance(value, agent.Answer) else answer(value)
         return answers
+
+    def noul(self, question, state):
+        self.nouls.append((question, state))
+        return self.noul_value
 
     def score(self, questions, levels, state):
         self.score_batches.append(questions)
@@ -251,10 +257,10 @@ class Harness:
         monkeypatch.setattr(agent, "settle", lambda page: (next(self.snapshots), 12.0, False))
         monkeypatch.setattr(agent, "act", lambda page, decision: self.acted.append(decision))
 
-    def run(self, jev, replies=(), dry_run=False, inputs=INPUTS, max_steps=5):
+    def run(self, jev, replies=(), dry_run=False, inputs=INPUTS, max_steps=5, done_when="Reply is shown."):
         answers = iter(replies)
         limits = agent.Limits(max_steps, 0.7, dry_run)
-        return agent.run_loop(self.page, jev, "goal", inputs, self.log, limits, lambda text: next(answers))
+        return agent.run_loop(self.page, jev, "goal", inputs, self.log, limits, lambda text: next(answers), done_when)
 
     def steps(self):
         return [json.loads(line) for line in (self.log.dir / "steps.jsonl").read_text().splitlines()]
@@ -551,6 +557,121 @@ def test_text_that_appears_during_a_wait_stays_new(monkeypatch, tmp_path):
     harness = Harness(monkeypatch, tmp_path, pages)
     harness.run(FakeJev(op="WAIT"), max_steps=3)
     assert [step["page_notices"] for step in harness.steps()] == ["", "friend", "friend"]
+
+
+def low_done():
+    return agent.Answer("DONE", {"DONE": 0.38, "WAIT": 0.15, "SCROLL_DOWN": 0.14}, 0.28)
+
+
+def test_low_confidence_done_with_a_high_noul_ends_the_run(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [text_page("Old")])
+    jev = FakeJev(op=low_done(), noul=0.8)
+    assert harness.run(jev).status == "done"
+    record = harness.steps()[0]
+    assert record["source"] == "jev_noul"
+    assert record["noul_done"] == {"value": 0.8, "trigger": "low_confidence_done"}
+    assert record["confidence"] == 0.8
+    assert record["op"]["top3"][0][0] == "DONE"
+    assert jev.nouls[0][0] == "Is this true: Reply is shown?"
+
+
+def test_a_low_noul_falls_through_to_the_human_prompt(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [text_page("Old")])
+    outcome = harness.run(FakeJev(op=low_done(), noul=0.79), replies=["a"])
+    assert outcome.status == "aborted"
+
+
+def test_a_low_noul_is_logged_when_the_human_confirms_done(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [text_page("Old")])
+    assert harness.run(FakeJev(op=low_done(), noul=0.5), replies=["1"]).status == "done"
+    record = harness.steps()[0]
+    assert record["source"] == "human"
+    assert record["noul_done"] == {"value": 0.5, "trigger": "low_confidence_done"}
+
+
+def test_noul_uses_the_usual_state_with_untrusted_notices(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [text_page("Old", "friend")])
+    jev = FakeJev(op=low_done(), noul=0.9)
+    harness.run(jev)
+    state = jev.nouls[0][1]
+    assert state.keys() == {"goal", "url", "title", "last_actions", "elements", "page_notices_untrusted"}
+    assert state["page_notices_untrusted"] == "friend"
+
+
+def test_confident_done_needs_no_noul(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [text_page("Old")])
+    jev = FakeJev(op="DONE")
+    assert harness.run(jev).status == "done"
+    assert not jev.nouls
+    assert harness.steps()[0]["noul_done"] is None
+
+
+def test_a_doubtful_op_other_than_done_triggers_no_noul(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [text_page("Old")])
+    jev = FakeJev(op=agent.Answer("WAIT", {"WAIT": 0.4, "DONE": 0.3}, 0.1))
+    harness.run(jev, replies=["a"])
+    assert not jev.nouls
+
+
+def test_check_fires_on_the_settled_page_after_an_approved_click(monkeypatch, tmp_path):
+    pages = [snapshot(element(1, name="Run")), text_page("Old\nfriend")]
+    harness = Harness(monkeypatch, tmp_path, pages)
+    jev = FakeJev(noul=0.95)
+    assert harness.run(jev, replies=["y"]).status == "done"
+    first, second = harness.steps()
+    assert first["noul_done"] is None
+    assert second["noul_done"] == {"value": 0.95, "trigger": "after_gate"}
+    assert second["source"] == "jev_noul"
+    assert len(jev.nouls) == 1
+    assert len(jev.requests) == 1  # the passing check replaces that step's op Choice
+
+
+def test_low_noul_after_a_gate_falls_through_to_the_op_choice(monkeypatch, tmp_path):
+    pages = [snapshot(element(1, name="Run")), snapshot(element(1, name="Next")), snapshot(element(1, name="Next"))]
+    harness = Harness(monkeypatch, tmp_path, pages)
+    jev = FakeJev(noul=0.2)
+    harness.run(jev, replies=["y"], max_steps=3)
+    steps = harness.steps()
+    assert len(harness.acted) == 3
+    assert steps[1]["noul_done"] == {"value": 0.2, "trigger": "after_gate"}
+    assert steps[2]["noul_done"] is None
+    assert len(jev.nouls) == 1
+
+
+def test_one_step_never_asks_the_same_noul_twice(monkeypatch, tmp_path):
+    pages = [snapshot(element(1, name="Run")), text_page("Old")]
+    harness = Harness(monkeypatch, tmp_path, pages)
+    jev = FakeJev(noul=0.2)
+    jev.script["op"] = "CLICK"
+
+    def low_done_after_first_click(questions, state, real=jev.choose_many):
+        jev.script["op"] = low_done() if len(jev.requests) else "CLICK"
+        return real(questions, state)
+
+    monkeypatch.setattr(jev, "choose_many", low_done_after_first_click)
+    harness.run(jev, replies=["y", "a"])
+    assert len(jev.nouls) == 1
+    assert harness.acted
+
+
+def test_no_check_after_a_click_that_needed_no_approval(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1)), snapshot(element(1))])
+    jev = FakeJev()
+    harness.run(jev, max_steps=2)
+    assert not jev.nouls
+
+
+def test_no_check_when_the_approved_click_failed(monkeypatch, tmp_path):
+    pages = [snapshot(element(1, name="Run")), snapshot(element(1, name="Next"))]
+    harness = Harness(monkeypatch, tmp_path, pages)
+
+    def fail(page, decision):
+        raise agent.ActionError("element 1 is gone")
+
+    monkeypatch.setattr(agent, "act", fail)
+    jev = FakeJev()
+    harness.run(jev, replies=["y"], max_steps=2)
+    assert not jev.nouls
 
 
 def test_done_ends_the_loop(monkeypatch, tmp_path):

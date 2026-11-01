@@ -35,6 +35,7 @@ MAX_CHOICE = 255
 SHORTLIST = 50
 SCORE_BATCH = 100
 ACT_TIMEOUT_MS = 5000
+NOUL_DONE_THRESHOLD = 0.8
 SETTLE_POLL_MS = 300
 SETTLE_CAP_S = 10
 MIN_SETTLED_ELEMENTS = 5
@@ -110,6 +111,7 @@ class Task(BaseModel):
     id: str
     enabled: bool = True
     goal: str
+    done_when: str
     start_url: str
     inputs: dict[str, str]
     max_steps: int = 40
@@ -117,7 +119,7 @@ class Task(BaseModel):
 
     @model_validator(mode="after")
     def check(self) -> Task:
-        fields = {field for _, field, _, _ in Formatter().parse(self.goal) if field}
+        fields = {field for text in (self.goal, self.done_when) for _, field, _, _ in Formatter().parse(text) if field}
         if fields - set(self.inputs) - {"run_id"}:
             raise ValueError(f"goal uses missing inputs: {sorted(fields - set(self.inputs))}")
         for key, value in self.inputs.items():
@@ -130,9 +132,10 @@ class Task(BaseModel):
             raise ValueError(f"unknown verifier: {self.verifier}")
         return self
 
-    def render(self, run_id: str) -> tuple[str, dict[str, str]]:
+    def render(self, run_id: str) -> tuple[str, dict[str, str], str]:
         inputs = {key: value.format(run_id=run_id) for key, value in self.inputs.items()}
-        return self.goal.format(run_id=run_id, **inputs), inputs
+        goal, done_when = (text.format(run_id=run_id, **inputs) for text in (self.goal, self.done_when))
+        return goal, inputs, done_when
 
 
 def load_task(task_id: str, path: Path = ROOT / "tasks.yaml") -> Task:
@@ -456,7 +459,7 @@ class Decision:
 
     @property
     def source(self) -> str:
-        return "human" if any(head.source == "human" for head in self.heads.values()) else "jev"
+        return next((head.source for head in self.heads.values() if head.source != "jev"), "jev")
 
     def doubtful(self, threshold: float) -> list[str]:
         return [name for name, head in self.heads.items() if head.source == "jev" and head.confidence < threshold]
@@ -482,15 +485,36 @@ def shortlist(jev: Jev, items: list[Element], brief: dict) -> list[Element]:
     return sorted(ranked[:SHORTLIST], key=lambda e: e.idx)
 
 
-def decide(jev: Jev, goal: str, snapshot: Snapshot, history: list[dict], inputs: dict[str, str],
-           notices: str = "") -> Decision:
-    brief = {"goal": goal, "url": redact(clean(snapshot.url)), "title": short(snapshot.title)}
-    heads = {op: shortlist(jev, items, brief) for op, items in candidates(snapshot.elements, inputs).items()}
-    kept = {e.idx: e for items in heads.values() for e in items}
-    rows = snapshot.elements if len(snapshot.elements) <= MAX_CHOICE else [kept[i] for i in sorted(kept)]
+def brief_state(goal: str, snapshot: Snapshot) -> dict:
+    return {"goal": goal, "url": redact(clean(snapshot.url)), "title": short(snapshot.title)}
+
+
+def full_state(brief: dict, history: list[dict], rows: list[Element], notices: str) -> dict:
     state = {**brief, "last_actions": history[-5:], "elements": "\n".join(e.row for e in rows)}
     if notices:
         state["page_notices_untrusted"] = notices
+    return state
+
+
+def ask_done(jev: Jev, done_when: str, goal: str, snapshot: Snapshot, history: list[dict], notices: str,
+             trigger: str) -> dict:
+    """A focused yes/no on the task's evidence, because the 8-way op Choice spreads DONE too thin."""
+    state = full_state(brief_state(goal, snapshot), history, snapshot.elements[:MAX_CHOICE], notices)
+    return {"value": jev.noul(f"Is this true: {done_when.rstrip('.')}?", state), "trigger": trigger}
+
+
+def noul_decision(value: float, turn: Turn | None = None) -> Decision:
+    probabilities = turn.answers["op"].probabilities if turn else {"DONE": value}
+    return Decision("DONE", turn, heads={"op": Answer("DONE", probabilities, value, "jev_noul")})
+
+
+def decide(jev: Jev, goal: str, snapshot: Snapshot, history: list[dict], inputs: dict[str, str],
+           notices: str = "") -> Decision:
+    brief = brief_state(goal, snapshot)
+    heads = {op: shortlist(jev, items, brief) for op, items in candidates(snapshot.elements, inputs).items()}
+    kept = {e.idx: e for items in heads.values() for e in items}
+    rows = snapshot.elements if len(snapshot.elements) <= MAX_CHOICE else [kept[i] for i in sorted(kept)]
+    state = full_state(brief, history, rows, notices)
     questions = {"op": (RULES, {op: text for op, text in OPS.items() if op in heads or op not in TARGETED})}
     for op, items in heads.items():
         text = f"If the next operation is {op}, which listed element should it use?"
@@ -664,6 +688,7 @@ class RunLog:
         print(f"step {record['step']:02d} {record['op']['choice']} {record['target_row']} "
               f"conf={record['confidence']:.2f} source={record['source']} gate={record['gate']} "
               f"{record['result']} settle={record['settle_ms']:.0f}ms{' settle_timeout' if record['settle_timeout'] else ''} "
+              f"{'noul={value:.2f}({trigger}) '.format(**record['noul_done']) if record['noul_done'] else ''}"
               f"observe={ms['observe']:.0f}ms jev={ms['jev']:.0f}ms act={ms['act']:.0f}ms")
 
     def summary(self, record: dict) -> None:
@@ -688,9 +713,10 @@ class Limits:
 
 
 def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLog, limits: Limits,
-             ask: Callable[[str], str] = input) -> Outcome:
+             ask: Callable[[str], str] = input, done_when: str = "") -> Outcome:
     history: list[dict] = []
     failures, paused, snapshot, baseline = 0, 0.0, None, None
+    check_done = False
     started = time.monotonic()
     for step in range(1, limits.max_steps + 1):
         if time.monotonic() - started - paused > MAX_WALL_S:
@@ -708,7 +734,18 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
 
         tick = time.perf_counter()
         notices = page_notices(snapshot, baseline, inputs)
-        decision = decide(jev, goal, snapshot, history, inputs, notices)
+        noul_done, decision = None, None
+        if check_done and done_when:
+            noul_done = ask_done(jev, done_when, goal, snapshot, history, notices, "after_gate")
+            if noul_done["value"] >= NOUL_DONE_THRESHOLD:
+                decision = noul_decision(noul_done["value"])
+        check_done = False
+        if decision is None:
+            decision = decide(jev, goal, snapshot, history, inputs, notices)
+            if decision.op == "DONE" and decision.confidence < limits.threshold and done_when:
+                noul_done = noul_done or ask_done(jev, done_when, goal, snapshot, history, notices, "low_confidence_done")
+                if noul_done["value"] >= NOUL_DONE_THRESHOLD:
+                    decision = noul_decision(noul_done["value"], decision.turn)
         jev_ms = (time.perf_counter() - tick) * 1000
 
         pause_started = time.monotonic()
@@ -740,6 +777,7 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
                 failures += 1
                 result = f"failed: {short(str(error))}"
             act_ms = (time.perf_counter() - tick) * 1000
+            check_done = gate_result == "approved" and result == "ok"
 
         row = element.row if element else ""
         history.append({"op": decision.op, "element": row, "result": result})
@@ -749,7 +787,7 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
         human_target = clean(row) if target and target.source == "human" else None
         log.step({"step": step, "url": redact(clean(snapshot.url)), "element_count": len(snapshot.elements),
                   "op": head_log(decision.heads["op"]), "target": head_log(target), "target_row": clean(row),
-                  "human_target": human_target, "page_notices": notices,
+                  "human_target": human_target, "page_notices": notices, "noul_done": noul_done,
                   "input": decision.input_key, "confidence": decision.confidence, "source": decision.source,
                   "gate": gate_result, "result": result, "settle_ms": settle_ms, "settle_timeout": settle_timeout,
                   "latency_ms": {"observe": snapshot.ms, "jev": jev_ms, "act": act_ms},
@@ -785,14 +823,14 @@ def preflight(cdp_url: str) -> list[str]:
     return problems
 
 
-def drive(task: Task, goal: str, inputs: dict[str, str], log: RunLog, limits: Limits, cdp_url: str,
-          ask: Callable[[str], str]) -> Outcome:
+def drive(task: Task, goal: str, inputs: dict[str, str], done_when: str, log: RunLog, limits: Limits,
+          cdp_url: str, ask: Callable[[str], str]) -> Outcome:
     pw = sync_playwright().start()
     try:  # pw.stop() only disconnects; the human's browser stays open
         page = pw.chromium.connect_over_cdp(cdp_url).contexts[0].new_page()
         page.goto(task.start_url)
         jev = Jev(os.environ.get("JEV_MODEL", "jev-latest"))
-        return run_loop(page, jev, goal, inputs, log, limits, ask)
+        return run_loop(page, jev, goal, inputs, log, limits, ask, done_when)
     finally:
         pw.stop()
 
@@ -815,7 +853,7 @@ def run_task(task_id: str, dry_run: bool = False, ask: Callable[[str], str] = in
         return 2
 
     run_id = verify.new_run_id()
-    goal, inputs = task.render(run_id)
+    goal, inputs, done_when = task.render(run_id)
     log = RunLog(run_id)
     check = verify.CHECKS[task.verifier]
     threshold = float(os.environ.get("JEV_CONFIDENCE_THRESHOLD", "0.7"))
@@ -824,7 +862,7 @@ def run_task(task_id: str, dry_run: bool = False, ask: Callable[[str], str] = in
     outcome, passed, teardown_result = Outcome("error"), None, []
     print(f"Run {run_id}: {task.id}{' (dry run)' if dry_run else ''}")
     try:
-        outcome = drive(task, goal, inputs, log, limits, cdp_url, ask)
+        outcome = drive(task, goal, inputs, done_when, log, limits, cdp_url, ask)
         if outcome.status == "done":
             final = outcome.snapshot
             result = check.verify(run_id, verify.Context(run_id, inputs, started_at, final.url, final.text))

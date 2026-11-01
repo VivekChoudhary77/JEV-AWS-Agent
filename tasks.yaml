@@ -1,4 +1,5 @@
 # {name} placeholders resolve from inputs; {run_id} is generated per run.
+# `done_when` is the visible evidence that the task finished; it resolves like `goal`.
 # `verifier` is a key in verify.CHECKS. `existing_*` inputs reference resources the agent didn't create.
 
 - id: 00_read_budget
@@ -6,6 +7,7 @@
   goal: >-
     Open the Budgets page and open the existing budget whose name does not start with
     jevagent- so its details page is showing, then finish with DONE. Change nothing.
+  done_when: "The budget details page for the non-jevagent budget is showing."
   start_url: "https://us-east-1.console.aws.amazon.com/costmanagement/home?region=us-east-1#/budgets"
   inputs: {}
   max_steps: 15
@@ -19,6 +21,7 @@
     budget name and {budget_amount} as the budgeted amount, then click Next.
     On "Configure alerts", click Next. On "Attach actions - Optional", click Next.
     On "Review", click Create budget.
+  done_when: "A banner says the budget {budget_name} was created successfully."
   start_url: "https://us-east-1.console.aws.amazon.com/costmanagement/home?region=us-east-1#/budgets/create"
   inputs:
     budget_name: "jevagent-{run_id}-budget"
@@ -34,6 +37,7 @@
     turn on "Custom execution role" and select the existing role {existing_role_name}.
     Also under Additional settings, enable the function URL (it may be listed under
     HTTP(S) endpoints) with auth type AWS_IAM, never NONE. Then create the function.
+  done_when: "A banner says the function {function_name} was created successfully."
   start_url: "https://us-east-1.console.aws.amazon.com/lambda/home?region=us-east-1#/create/function"
   inputs:
     function_name: "jevagent-{run_id}-fn"
@@ -48,6 +52,7 @@
     Launch one EC2 instance named {instance_name} of type {instance_type} in the default
     VPC. Proceed without a key pair. Under Network settings choose "Select existing
     security group" and pick the default security group; do not create a security group.
+  done_when: "A banner says the instance launch succeeded."
   start_url: "https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#LaunchInstances:"
   inputs:
     instance_name: "jevagent-{run_id}-ec2"
@@ -61,6 +66,7 @@
     Open the Bedrock playground. Leave Mode as Chat. Click Select model, choose provider
     Amazon and model Nova Micro, then Apply. Type "{prompt}" into the prompt box and click
     Run. Finish with DONE once the model's reply appears below the prompt.
+  done_when: "A model reply is shown below the prompt, and the Output token count is shown."
   start_url: "https://us-east-1.console.aws.amazon.com/bedrock/home?region=us-east-1#/"
   inputs:
     prompt: "Reply with one word: hello"
@@ -74,6 +80,7 @@
     template, single-AZ, automated backups disabled. Under credentials choose
     "Self managed" (NOT Secrets Manager) and "Auto generate password"; never type a
     password.
+  done_when: "A banner says the database {db_instance_name} is being created."
   start_url: "https://us-east-1.console.aws.amazon.com/rds/home?region=us-east-1#launch-dbinstance:"
   inputs:
     db_instance_name: "jevagent-{run_id}-db"

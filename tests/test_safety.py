@@ -100,21 +100,42 @@ def test_clean_strips_terminal_escapes():
 
 
 def task(**overrides):
-    fields = {"id": "t", "goal": "Make {thing_name}", "start_url": LAMBDA, "verifier": "read_budget",
+    fields = {"id": "t", "goal": "Make {thing_name}", "done_when": "{thing_name} is shown.",
+              "start_url": LAMBDA, "verifier": "read_budget",
               "inputs": {"thing_name": "jevagent-{run_id}-x"}}
     return agent.Task(**{**fields, **overrides})
 
 
 def test_schema_accepts_and_renders_a_valid_task():
-    goal, inputs = task().render("26103015140a3f")
+    goal, inputs, done_when = task().render("26103015140a3f")
     assert goal == "Make jevagent-26103015140a3f-x"
+    assert done_when == "jevagent-26103015140a3f-x is shown."
     assert inputs == {"thing_name": "jevagent-26103015140a3f-x"}
 
 
 def test_schema_rejects_missing_inputs_field():
-    fields = {"id": "t", "goal": "g", "start_url": LAMBDA, "verifier": "read_budget"}
+    fields = {"id": "t", "goal": "g", "done_when": "d", "start_url": LAMBDA, "verifier": "read_budget"}
     with pytest.raises(ValidationError):
         agent.Task(**fields)
+
+
+def test_schema_requires_done_when():
+    fields = {"id": "t", "goal": "g", "inputs": {}, "start_url": LAMBDA, "verifier": "read_budget"}
+    with pytest.raises(ValidationError, match="done_when"):
+        agent.Task(**fields)
+
+
+def test_schema_rejects_done_when_placeholder_without_input():
+    with pytest.raises(ValidationError, match="missing inputs"):
+        task(done_when="{other} is shown.")
+
+
+def test_done_when_resolves_in_the_real_tasks():
+    run_id = "26103015140a3f"
+    budget = agent.load_task("01_create_budget").render(run_id)[2]
+    assert budget == f"A banner says the budget jevagent-{run_id}-budget was created successfully."
+    database = agent.load_task("99_rds_create_db").render(run_id)[2]
+    assert database == f"A banner says the database jevagent-{run_id}-db is being created."
 
 
 def test_schema_rejects_goal_placeholder_without_input():
