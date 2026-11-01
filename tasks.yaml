@@ -1,0 +1,81 @@
+# {name} placeholders resolve from inputs; {run_id} is generated per run.
+# `verifier` is a key in verify.CHECKS. `existing_*` inputs reference resources the agent didn't create.
+
+- id: 00_read_budget
+  enabled: true
+  goal: >-
+    Open the Budgets page and open the existing budget whose name does not start with
+    jevagent- so its details page is showing, then finish with DONE. Change nothing.
+  start_url: "https://us-east-1.console.aws.amazon.com/costmanagement/home?region=us-east-1#/budgets"
+  inputs: {}
+  max_steps: 15
+  verifier: read_budget
+
+- id: 01_create_budget
+  enabled: true
+  goal: >-
+    Create a cost budget. On the first page choose "Customize (advanced)", keep
+    Cost budget, and click Next. On "Set your budget", enter {budget_name} as the
+    budget name and {budget_amount} as the budgeted amount, then click Next.
+    On "Configure alerts", click Next. On "Attach actions - Optional", click Next.
+    On "Review", click Create budget.
+  start_url: "https://us-east-1.console.aws.amazon.com/costmanagement/home?region=us-east-1#/budgets/create"
+  inputs:
+    budget_name: "jevagent-{run_id}-budget"
+    budget_amount: "1"
+  max_steps: 40
+  verifier: create_budget
+
+- id: 03_lambda_function_url
+  enabled: true
+  goal: >-
+    Create a Lambda function from scratch named {function_name}. Open the Runtime
+    dropdown and change it from the default to {runtime}. Under Additional settings,
+    turn on "Custom execution role" and select the existing role {existing_role_name}.
+    Also under Additional settings, enable the function URL (it may be listed under
+    HTTP(S) endpoints) with auth type AWS_IAM, never NONE. Then create the function.
+  start_url: "https://us-east-1.console.aws.amazon.com/lambda/home?region=us-east-1#/create/function"
+  inputs:
+    function_name: "jevagent-{run_id}-fn"
+    runtime: "Python 3.14"
+    existing_role_name: "jev-shared-lambda-exec"
+  max_steps: 40
+  verifier: lambda_function_url
+
+- id: 04_ec2_launch_t3micro
+  enabled: true
+  goal: >-
+    Launch one EC2 instance named {instance_name} of type {instance_type} in the default
+    VPC. Proceed without a key pair. Under Network settings choose "Select existing
+    security group" and pick the default security group; do not create a security group.
+  start_url: "https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#LaunchInstances:"
+  inputs:
+    instance_name: "jevagent-{run_id}-ec2"
+    instance_type: "t3.micro"
+  max_steps: 40
+  verifier: ec2_instance
+
+- id: 05_bedrock_playground_prompt
+  enabled: true
+  goal: >-
+    Open the Bedrock playground in Chat mode. Click Select model, choose provider
+    Amazon and model Nova Micro, then Apply. Enter the prompt {prompt}, run it once,
+    and finish with DONE once a response is showing.
+  start_url: "https://us-east-1.console.aws.amazon.com/bedrock/home?region=us-east-1#/"
+  inputs:
+    prompt: "Reply with one word: hello"
+  max_steps: 30
+  verifier: bedrock_prompt
+
+- id: 99_rds_create_db
+  enabled: false
+  goal: >-
+    Create an RDS database with identifier {db_instance_name}. Choose the Free tier
+    template, single-AZ, automated backups disabled. Under credentials choose
+    "Self managed" (NOT Secrets Manager) and "Auto generate password"; never type a
+    password.
+  start_url: "https://us-east-1.console.aws.amazon.com/rds/home?region=us-east-1#launch-dbinstance:"
+  inputs:
+    db_instance_name: "jevagent-{run_id}-db"
+  max_steps: 40
+  verifier: rds_instance

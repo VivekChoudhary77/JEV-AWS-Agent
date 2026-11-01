@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head><title>Controls</title></head>
+<body>
+  <h1 style="display: none">Hidden heading</h1>
+  <h1>Budgets</h1>
+  <button id="next">Next</button>
+  <a href="/elsewhere">Budgets</a>
+  <label for="bucket">Budget name</label>
+  <input id="bucket" value="draft">
+  <select aria-label="Period"><option>Daily</option><option selected>Monthly</option></select>
+  <div role="button" tabindex="0">Create budget</div>
+  <label>
+    <input type="radio" name="role" style="opacity: 0; position: absolute">
+    Use an existing role
+  </label>
+  <input type="checkbox" aria-label="Enable" checked>
+
+  <button id="disabled" disabled>Disabled</button>
+  <div role="button" aria-disabled="true">Aria disabled</div>
+  <button style="display: none">Display none</button>
+  <button style="visibility: hidden">Visibility hidden</button>
+  <button style="opacity: 0">Transparent</button>
+  <div aria-hidden="true"><button>Aria hidden</button></div>
+  <input type="password" aria-label="Password">
+  <input type="password" role="textbox" aria-label="Role textbox password">
+  <input type="file" aria-label="Upload">
+  <input type="hidden" value="secret">
+</body>
+</html>

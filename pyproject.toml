@@ -1,0 +1,28 @@
+[project]
+name = "jev-console-agent"
+version = "0.1.0"
+description = "Browser agent for predefined AWS Console tasks: Jev decides, Playwright acts, boto3 verifies."
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.43.123",
+    "playwright>=1.64.1",
+    "pydantic>=2.14.2",
+    "python-dotenv>=1.2.4",
+    "pyyaml>=6.0.3",
+    "typesafe-sdk>=0.7.5,<0.8",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-m 'not live'"
+markers = ["live: calls a real external API; run with `uv run pytest -m live`"]
+
+[dependency-groups]
+dev = [
+    "moto[budgets,ec2,iam,lambda,rds,sts]>=5.2.5",
+    "pytest>=9.2.0",
+]

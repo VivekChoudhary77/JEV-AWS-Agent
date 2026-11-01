@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<head><title>Shadow</title></head>
+<body>
+  <button>Before</button>
+  <div id="host"></div>
+  <iframe src="frame.html" title="Same origin"></iframe>
+  <script>
+    const root = document.getElementById("host").attachShadow({ mode: "open" });
+    root.innerHTML = '<span id="label">Inside shadow</span><button aria-labelledby="label"></button>';
+  </script>
+</body>
+</html>

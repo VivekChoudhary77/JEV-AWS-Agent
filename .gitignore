@@ -1,0 +1,10 @@
+.env
+runs/
+*.png
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+CLAUDE.md
+CLAUDE.local.md

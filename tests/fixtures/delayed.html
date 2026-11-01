@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<head><title>Delayed</title></head>
+<body>
+  <script>
+    const add = (from, to) => {
+      for (let i = from; i <= to; i++) {
+        const button = document.createElement("button");
+        button.textContent = `Late ${i}`;
+        document.body.append(button);
+      }
+    };
+    setTimeout(() => add(1, 2), 500);
+    setTimeout(() => add(3, 8), 1000);
+    setTimeout(() => history.replaceState(null, "", "#/budgets/overview"), 1100);
+  </script>
+</body>
+</html>
