@@ -5,6 +5,7 @@ import os
 
 import httpx2
 import pytest
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from typesafe_sdk import TypeSafeClient
 
@@ -13,8 +14,8 @@ import agent
 INPUTS = {"budget_name": "jevagent-x-budget", "budget_amount": "1"}
 
 
-def element(idx, role="button", name="Next", tag="button", editable=False, href=""):
-    return agent.Element(idx, role, name, tag, "", "", editable, href, {})
+def element(idx, role="button", name="Next", tag="button", editable=False, href="", value=""):
+    return agent.Element(idx, role, name, tag, "", value, editable, href, {})
 
 
 def snapshot(*elements, url="https://us-east-1.console.aws.amazon.com/lambda/home"):
@@ -28,10 +29,12 @@ def answer(choice, confidence=0.95, **others):
 class FakeJev:
     """Scripted answers: `op`, `target` and `input` may be plain labels or Answer objects."""
 
-    def __init__(self, op="CLICK", target="1", input="budget_name", scores=None, noul=0.1):
+    def __init__(self, op="CLICK", target="1", input="budget_name", scores=None, noul=0.1, readiness=0.91):
         self.script = {"op": op, "target": target, "input": input}
         self.noul_value = noul
+        self.readiness_value = readiness
         self.nouls = []
+        self.readiness_asks = []
         self.scores = scores or {}
         self.model = "fake"
         self.requests = []
@@ -50,6 +53,9 @@ class FakeJev:
         return answers
 
     def noul(self, question, state):
+        if question == agent.READINESS_QUESTION:
+            self.readiness_asks.append(state)
+            return self.readiness_value
         self.nouls.append((question, state))
         return self.noul_value
 
@@ -674,6 +680,140 @@ def test_no_check_when_the_approved_click_failed(monkeypatch, tmp_path):
     assert not jev.nouls
 
 
+READY = "Readiness: 0.91"
+WARNING = "⚠ Readiness 0.42: the form may be incomplete. Check the browser before approving."
+
+
+def commit_page(*fields):
+    return snapshot(*fields, element(len(fields) + 1, name="Create budget"))
+
+
+def empty_required():
+    return element(1, "textbox", "Budget name required", "input", editable=True)
+
+
+def commit_jev(fields=0, **kwargs):
+    return FakeJev(target=str(fields + 1), **kwargs)
+
+
+@pytest.mark.parametrize("value, missing, expected", [
+    (0.91, [], [READY]),
+    (0.8, [], ["Readiness: 0.80"]),
+    (0.79, [], ["⚠ Readiness 0.79: the form may be incomplete. Check the browser before approving."]),
+    (0.42, ["[1] x"], [WARNING, "  Required with no value: [1] x"]),
+    (0.91, ["[1] x"], ["⚠ Readiness 0.91: the form may be incomplete. Check the browser before approving.",
+                       "  Required with no value: [1] x"]),
+])
+def test_readiness_lines(value, missing, expected):
+    assert agent.readiness_lines({"value": value, "missing_required": missing}) == expected
+
+
+@pytest.mark.parametrize("name, value, role, missing", [
+    ("Name required", "", "textbox", True),
+    ("NAME (REQUIRED)", "  ", "textbox", True),
+    ("Name required", "x", "textbox", False),
+    ("Role required", "collapsed", "combobox", True),
+    ("Terms required", "unchecked", "checkbox", True),
+    ("Terms required", "checked", "checkbox", False),
+    ("Description, not required", "", "textbox", False),
+    ("Name", "", "textbox", False),
+    ("Plan required", "unchecked", "radio", False),
+    ("Required permissions", "", "link", False),
+    ("Create required resources", "", "button", False),
+])
+def test_missing_required(name, value, role, missing):
+    assert bool(agent.missing_required([element(1, role, name, value=value)])) is missing
+
+
+def test_a_ready_form_shows_the_score_before_the_prompt(monkeypatch, tmp_path, capsys):
+    harness = Harness(monkeypatch, tmp_path, [commit_page()])
+    harness.run(commit_jev(), replies=["n"])
+    out = capsys.readouterr().out
+    assert READY in out
+    assert "⚠" not in out
+
+
+def test_low_readiness_warns_and_lists_required_fields(monkeypatch, tmp_path, capsys):
+    harness = Harness(monkeypatch, tmp_path, [commit_page(empty_required())])
+    harness.run(commit_jev(1, readiness=0.42), replies=["n"])
+    out = capsys.readouterr().out
+    assert WARNING in out
+    assert 'Required with no value: [1] textbox "Budget name required"' in out
+
+
+def test_an_empty_required_field_warns_even_when_jev_is_confident(monkeypatch, tmp_path, capsys):
+    harness = Harness(monkeypatch, tmp_path, [commit_page(empty_required())])
+    harness.run(commit_jev(1, readiness=0.99), replies=["n"])
+    assert "⚠ Readiness 0.99" in capsys.readouterr().out
+
+
+def test_high_readiness_never_approves(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [commit_page()])
+    outcome = harness.run(commit_jev(readiness=1.0), replies=["n"])
+    assert outcome.status == "denied"
+    assert not harness.acted
+
+
+def test_low_readiness_never_blocks_the_humans_y(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [commit_page(empty_required())])
+    harness.run(commit_jev(1, readiness=0.0), replies=["y"], max_steps=1)
+    assert harness.steps()[0]["gate"] == "approved"
+    assert len(harness.acted) == 1
+
+
+def test_readiness_is_logged_at_a_gate(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [commit_page(empty_required())])
+    harness.run(commit_jev(1, readiness=0.42), replies=["n"])
+    assert harness.steps()[0]["readiness"] == {
+        "value": 0.42, "missing_required": ['[1] textbox "Budget name required"']}
+
+
+def test_no_readiness_check_on_a_click_without_a_gate(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1))])
+    jev = FakeJev()
+    harness.run(jev, max_steps=1)
+    assert not jev.readiness_asks
+    assert harness.steps()[0]["readiness"] is None
+
+
+def test_dry_run_still_reports_readiness(monkeypatch, tmp_path, capsys):
+    harness = Harness(monkeypatch, tmp_path, [commit_page()])
+    jev = commit_jev()
+    harness.run(jev, dry_run=True)
+    assert READY in capsys.readouterr().out
+    assert harness.steps()[0]["readiness"]["value"] == 0.91
+
+
+def test_readiness_uses_the_usual_state_with_untrusted_notices(monkeypatch, tmp_path):
+    page = text_page("Old", "friend")
+    page.elements = [element(1, name="Create budget")]
+    harness = Harness(monkeypatch, tmp_path, [page])
+    jev = FakeJev()
+    harness.run(jev, replies=["n"])
+    assert jev.readiness_asks[0].keys() == {"goal", "url", "title", "last_actions", "elements", "page_notices_untrusted"}
+
+
+def test_a_commit_click_the_human_picked_still_gets_a_readiness_check(monkeypatch, tmp_path):
+    rows = [element(1, name="Create budget"), element(2, name="Help")]
+    harness = Harness(monkeypatch, tmp_path, [snapshot(*rows)])
+    jev = FakeJev(op=op_doubt(CLICK=0.5, WAIT=0.4), target=agent.Answer("1", {"1": 0.8, "2": 0.2}, 0.9))
+    harness.run(jev, replies=["1", "n"])
+    assert len(jev.readiness_asks) == 1
+
+
+def test_a_failed_readiness_check_ends_the_run_without_clicking(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [commit_page()])
+    jev = commit_jev()
+
+    def fail(question, state):
+        raise agent.JevError("unavailable")
+
+    monkeypatch.setattr(jev, "noul", fail)
+    with pytest.raises(agent.JevError):
+        harness.run(jev)
+    assert not harness.acted
+
+
 def test_done_ends_the_loop(monkeypatch, tmp_path):
     harness = Harness(monkeypatch, tmp_path, [snapshot(element(1))])
     assert harness.run(FakeJev(op="DONE")).status == "done"
@@ -718,6 +858,26 @@ def test_run_prints_teardown_after_the_verifier(monkeypatch, tmp_path, capsys):
     assert agent.run_task("01_create_budget") == 0
     out = capsys.readouterr().out
     assert out.index("Verifier passed") < out.index("Teardown: deleted [budget b]") < out.index("Finished:")
+
+
+def test_a_verifier_exception_is_a_clean_failure_with_a_summary(monkeypatch, tmp_path, capsys):
+    denied = ClientError({"Error": {"Code": "UnauthorizedOperation",
+                                    "Message": "arn:aws:iam::111122223333:user/verifier is not authorized"}},
+                         "DescribeVpcs")
+
+    def boom(run_id, ctx):
+        raise denied
+
+    fake_run(monkeypatch, tmp_path, agent.verify.Check(boom, lambda run_id: ["deleted instance i"]))
+    assert agent.run_task("01_create_budget") == 1
+    out = capsys.readouterr().out
+    assert out.index("Verifier ERROR:") < out.index("Teardown: deleted [instance i]") < out.index("Finished:")
+    assert "DescribeVpcs" in out and "111122223333" not in out
+    summary = json.loads(next(tmp_path.glob("*/summary.json")).read_text())
+    assert summary["verifier_passed"] is False
+    assert summary["claimed_done"] is True
+    assert summary["teardown_result"] == ["deleted instance i"]
+    assert "UnauthorizedOperation" in summary["reason"] and "111122223333" not in summary["reason"]
 
 
 def test_run_prints_a_teardown_failure(monkeypatch, tmp_path, capsys):

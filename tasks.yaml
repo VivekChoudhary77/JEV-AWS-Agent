@@ -49,9 +49,12 @@
 - id: 04_ec2_launch_t3micro
   enabled: true
   goal: >-
-    Launch one EC2 instance named {instance_name} of type {instance_type} in the default
-    VPC. Proceed without a key pair. Under Network settings choose "Select existing
-    security group" and pick the default security group; do not create a security group.
+    Launch one EC2 instance. In "Name and tags", type {instance_name} as the Name.
+    Leave the AMI and Instance type as they are ({instance_type}).
+    In "Key pair (login)", open the "Key pair name" dropdown and choose
+    "Proceed without a key pair". In "Network settings", choose
+    "Select existing security group" and select the security group named default.
+    Then click Launch instance.
   done_when: "A banner says the instance launch succeeded."
   start_url: "https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#LaunchInstances:"
   inputs:

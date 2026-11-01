@@ -362,6 +362,20 @@ def test_act_reaches_elements_inside_iframes(page, base_url):
     agent.act(page, decision(agent.observe(page), "CLICK", "Inside frame"))
 
 
+def test_a_filled_combobox_reports_its_value_not_its_expanded_state(page, base_url):
+    page.goto(f"{base_url}/required.html")
+    by_name = {element.name: element for element in agent.observe(page).elements}
+    assert by_name["Runtime required"].value == "Python 3.14"
+    assert by_name["Role required"].value == "collapsed"
+
+
+def test_missing_required_lists_only_empty_fields_named_required(page, base_url):
+    page.goto(f"{base_url}/required.html")
+    missing = agent.missing_required(agent.observe(page).elements)
+    assert [row.split(" ", 2)[2] for row in missing] == [
+        '"Budget name (required)"', '"Role required" (collapsed)', '"Accept terms required" (unchecked)']
+
+
 def test_act_refuses_an_element_that_changed_after_the_gate(page, base_url):
     page.goto(f"{base_url}/controls.html")
     snapshot = agent.observe(page)

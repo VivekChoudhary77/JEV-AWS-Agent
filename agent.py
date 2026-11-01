@@ -36,6 +36,7 @@ SHORTLIST = 50
 SCORE_BATCH = 100
 ACT_TIMEOUT_MS = 5000
 NOUL_DONE_THRESHOLD = 0.8
+READINESS_THRESHOLD = 0.8
 SETTLE_POLL_MS = 300
 SETTLE_CAP_S = 10
 MIN_SETTLED_ELEMENTS = 5
@@ -43,6 +44,7 @@ WAIT_MS = 1000
 SCROLL_PX = 600
 MAX_NOTICE_CHARS = 300
 MAX_NEW_TEXT_CHARS = 1000
+MAX_ERROR_CHARS = 300
 
 # Safety rules
 
@@ -200,6 +202,7 @@ const editableOf = el => !el.readOnly && (['INPUT', 'TEXTAREA'].includes(el.tagN
   : el.isContentEditable);
 const stateOf = el => {
   if (isToggle(el)) return el.checked ? 'checked' : 'unchecked';
+  if (['INPUT', 'TEXTAREA'].includes(el.tagName) && el.value) return el.value;  // comboboxes also have aria-expanded
   for (const [attr, on, off] of [['aria-checked', 'checked', 'unchecked'],
     ['aria-selected', 'selected', ''], ['aria-expanded', 'expanded', 'collapsed']]) {
     const value = el.getAttribute(attr);
@@ -496,10 +499,14 @@ def full_state(brief: dict, history: list[dict], rows: list[Element], notices: s
     return state
 
 
+def noul_state(goal: str, snapshot: Snapshot, history: list[dict], notices: str) -> dict:
+    return full_state(brief_state(goal, snapshot), history, snapshot.elements[:MAX_CHOICE], notices)
+
+
 def ask_done(jev: Jev, done_when: str, goal: str, snapshot: Snapshot, history: list[dict], notices: str,
              trigger: str) -> dict:
     """A focused yes/no on the task's evidence, because the 8-way op Choice spreads DONE too thin."""
-    state = full_state(brief_state(goal, snapshot), history, snapshot.elements[:MAX_CHOICE], notices)
+    state = noul_state(goal, snapshot, history, notices)
     return {"value": jev.noul(f"Is this true: {done_when.rstrip('.')}?", state), "trigger": trigger}
 
 
@@ -615,6 +622,13 @@ def prompt(ask: Callable[[str], str], text: str) -> str:
 # Gate and act
 
 
+READINESS_QUESTION = "Based on the goal, has every required field and choice been completed on this page?"
+REQUIRED_RE = re.compile(r"(?<!not )\brequired\b", re.IGNORECASE)
+# No radios: an unchecked option is normal in an answered group. Links and buttons show no value.
+VALUE_ROLES = ("textbox", "searchbox", "spinbutton", "combobox", "checkbox", "switch")
+NO_VALUE = ("", "unchecked", "collapsed", "expanded")
+
+
 class ActionError(Exception):
     pass
 
@@ -624,13 +638,33 @@ def needs_gate(decision: Decision) -> bool:
     return decision.op == "CLICK" and (target.borrowed_name or requires_approval(target.name))
 
 
-def gate(decision: Decision, url: str, dry_run: bool, ask: Callable[[str], str]) -> str:
+def missing_required(elements: list[Element]) -> list[str]:
+    return [clean(e.row) for e in elements if e.role in VALUE_ROLES and REQUIRED_RE.search(e.name)
+            and e.value.strip() in NO_VALUE]
+
+
+def ask_readiness(jev: Jev, goal: str, snapshot: Snapshot, history: list[dict], notices: str) -> dict:
+    """Only informs the human; nothing in the gate branches on it."""
+    state = noul_state(goal, snapshot, history, notices)
+    return {"value": jev.noul(READINESS_QUESTION, state), "missing_required": missing_required(snapshot.elements)}
+
+
+def readiness_lines(readiness: dict) -> list[str]:
+    value, missing = readiness["value"], readiness["missing_required"]
+    if value >= READINESS_THRESHOLD and not missing:
+        return [f"Readiness: {value:.2f}"]
+    warning = f"⚠ Readiness {value:.2f}: the form may be incomplete. Check the browser before approving."
+    return [warning, *(f"  Required with no value: {row}" for row in missing)]
+
+
+def gate(decision: Decision, url: str, dry_run: bool, ask: Callable[[str], str], readiness: dict | None) -> str:
     element = decision.target
     if not needs_gate(decision):
         return "not_required"
+    print(f"Approval needed on {redact(clean(url))}\n  {element.role}: {clean(element.name) or '(no name)'}")
+    print(*readiness_lines(readiness), sep="\n")
     if dry_run:
         return "dry_run_stop"
-    print(f"Approval needed on {redact(clean(url))}\n  {element.role}: {clean(element.name) or '(no name)'}")
     return "approved" if prompt(ask, "Type y to click: ") == "y" else "denied"
 
 
@@ -760,10 +794,13 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
         element = decision.target
         if decision.op == "CLICK" and element.href.startswith("http") and (bad := blocked_reason(element.href)):
             stop, reason = "blocked", f"link target: {bad}"
-        gate_screenshot = None
+        gate_screenshot, readiness = None, None
         if not stop and needs_gate(decision):
             gate_screenshot = capture(page, log.dir / f"step_{step:02d}_gate.png", full_page=True)
-        gate_result = "not_required" if stop else gate(decision, snapshot.url, limits.dry_run, ask)
+            tick = time.perf_counter()
+            readiness = ask_readiness(jev, goal, snapshot, history, notices)
+            jev_ms += (time.perf_counter() - tick) * 1000
+        gate_result = "not_required" if stop else gate(decision, snapshot.url, limits.dry_run, ask, readiness)
         paused += time.monotonic() - pause_started
         stop = stop or {"denied": "denied", "dry_run_stop": "dry_run_stop"}.get(gate_result, "")
 
@@ -788,7 +825,7 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
         log.step({"step": step, "url": redact(clean(snapshot.url)), "element_count": len(snapshot.elements),
                   "op": head_log(decision.heads["op"]), "target": head_log(target), "target_row": clean(row),
                   "human_target": human_target, "page_notices": notices, "noul_done": noul_done,
-                  "input": decision.input_key, "confidence": decision.confidence, "source": decision.source,
+                  "readiness": readiness, "input": decision.input_key, "confidence": decision.confidence, "source": decision.source,
                   "gate": gate_result, "result": result, "settle_ms": settle_ms, "settle_timeout": settle_timeout,
                   "latency_ms": {"observe": snapshot.ms, "jev": jev_ms, "act": act_ms},
                   "screenshot": screenshot, "gate_screenshot": gate_screenshot, "model": jev.model,
@@ -865,9 +902,14 @@ def run_task(task_id: str, dry_run: bool = False, ask: Callable[[str], str] = in
         outcome = drive(task, goal, inputs, done_when, log, limits, cdp_url, ask)
         if outcome.status == "done":
             final = outcome.snapshot
-            result = check.verify(run_id, verify.Context(run_id, inputs, started_at, final.url, final.text))
-            passed = result.passed
-            print(f"Verifier {'passed' if passed else 'FAILED'}: {result.detail}")
+            try:
+                result = check.verify(run_id, verify.Context(run_id, inputs, started_at, final.url, final.text))
+                passed = result.passed
+                print(f"Verifier {'passed' if passed else 'FAILED'}: {result.detail}")
+            except Exception as error:
+                passed, detail = False, redact(clean(str(error)))[:MAX_ERROR_CHARS]
+                outcome.reason = f"verifier error: {detail}"
+                print(f"Verifier ERROR: {detail}")
     except KeyboardInterrupt:
         outcome.status = "interrupted"
     except (JevError, PlaywrightError) as error:
