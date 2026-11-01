@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head><title>Nested</title></head>
+<body>
+  <div role="textbox" tabindex="0" id="wrapper">
+    <span>Write a prompt...</span>
+    <div role="textbox" contenteditable="true" id="prompt" style="min-height: 20px"></div>
+  </div>
+
+  <div role="button" tabindex="0" aria-label="Open settings">
+    <button id="inner-button" style="width: 20px; height: 20px"></button>
+  </div>
+
+  <div role="textbox" contenteditable="true" aria-label="Editable outer" style="min-height: 20px">
+    <div role="textbox" contenteditable="false" aria-label="Read only inner"></div>
+  </div>
+
+  <div role="treeitem" tabindex="0" aria-label="Parent item">
+    <div role="treeitem" tabindex="0">Child item</div>
+  </div>
+  <div role="menuitem" tabindex="0" aria-label="Parent menu">
+    <div role="menuitem" tabindex="0">Child menu</div>
+  </div>
+
+  <div role="textbox" contenteditable="true" aria-placeholder="Aria placeholder" style="min-height: 20px"></div>
+  <section aria-label="Plain region"><input placeholder="Plain placeholder"></section>
+  <section aria-label="Ancestor region">
+    <button style="width: 20px; height: 20px"></button>
+  </section>
+  <section aria-label="Inner region">
+    <div role="button" tabindex="0"><button style="width: 20px; height: 20px"></button></div>
+  </section>
+  <label>Wrapping label<div role="textbox" contenteditable="true" style="min-height: 20px"></div></label>
+  <button title="Only a title" style="width: 20px; height: 20px"></button>
+</body>
+</html>

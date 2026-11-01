@@ -58,9 +58,9 @@
 - id: 05_bedrock_playground_prompt
   enabled: true
   goal: >-
-    Open the Bedrock playground in Chat mode. Click Select model, choose provider
-    Amazon and model Nova Micro, then Apply. Enter the prompt {prompt}, run it once,
-    and finish with DONE once a response is showing.
+    Open the Bedrock playground. Leave Mode as Chat. Click Select model, choose provider
+    Amazon and model Nova Micro, then Apply. Type "{prompt}" into the prompt box and click
+    Run. Finish with DONE once the model's reply appears below the prompt.
   start_url: "https://us-east-1.console.aws.amazon.com/bedrock/home?region=us-east-1#/"
   inputs:
     prompt: "Reply with one word: hello"

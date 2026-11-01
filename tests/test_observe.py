@@ -67,6 +67,88 @@ def test_snapshot_reads_the_visible_page_heading(page, base_url):
     assert agent.observe(page).heading == "Budgets"
 
 
+def by_name(snapshot):
+    return {element.name: element for element in snapshot.elements}
+
+
+def test_wrapper_and_inner_textbox_become_one_named_textbox(page, base_url):
+    page.goto(f"{base_url}/nested.html")
+    snapshot = agent.observe(page)
+    prompts = [e for e in snapshot.elements if e.role == "textbox" and e.name == "Write a prompt..."]
+    assert len(prompts) == 1
+    assert prompts[0].editable
+    assert page.locator(f'[data-jev-idx="{prompts[0].idx}"]').get_attribute("id") == "prompt"
+    assert "" not in [e.name for e in snapshot.elements if e.role == "textbox"]
+
+
+def test_act_types_into_the_deduped_inner_textbox(page, base_url):
+    page.goto(f"{base_url}/nested.html")
+    snapshot = agent.observe(page)
+    target = by_name(snapshot)["Write a prompt..."]
+    turn = agent.Turn(None, {}, {}, {}, {"prompt": "Reply with one word: hello"}, snapshot)
+    agent.act(page, agent.Decision("TYPE", turn, target=target, input_key="prompt"))
+    assert page.locator("#prompt").inner_text() == "Reply with one word: hello"
+
+
+def test_nested_buttons_keep_the_inner_one_with_the_outer_name(page, base_url):
+    page.goto(f"{base_url}/nested.html")
+    snapshot = agent.observe(page)
+    outer = by_name(snapshot)["Open settings"]
+    assert page.locator(f'[data-jev-idx="{outer.idx}"]').get_attribute("id") == "inner-button"
+    assert not outer.borrowed_name
+
+
+def test_inner_textbox_that_is_not_editable_does_not_replace_the_real_one(page, base_url):
+    page.goto(f"{base_url}/nested.html")
+    assert by_name(agent.observe(page))["Editable outer"].editable
+
+
+def test_tree_and_menu_parents_are_kept(page, base_url):
+    page.goto(f"{base_url}/nested.html")
+    found = by_name(agent.observe(page))
+    assert found["Parent item"].role == "treeitem"
+    assert found["Child item"].role == "treeitem"
+    assert found["Parent menu"].role == "menuitem"
+    assert found["Child menu"].role == "menuitem"
+
+
+@pytest.mark.parametrize("name", [
+    "Aria placeholder", "Plain placeholder", "Ancestor region", "Wrapping label", "Only a title",
+])
+def test_name_fallbacks(page, base_url, name):
+    page.goto(f"{base_url}/nested.html")
+    assert name in by_name(agent.observe(page))
+
+
+def test_placeholder_beats_ancestor_label(page, base_url):
+    page.goto(f"{base_url}/nested.html")
+    assert not by_name(agent.observe(page))["Plain placeholder"].borrowed_name
+
+
+def test_a_name_from_an_ancestor_label_is_flagged_for_the_gate(page, base_url):
+    page.goto(f"{base_url}/nested.html")
+    assert by_name(agent.observe(page))["Ancestor region"].borrowed_name
+
+
+def test_inner_button_in_an_unnamed_wrapper_stays_flagged(page, base_url):
+    page.goto(f"{base_url}/nested.html")
+    assert by_name(agent.observe(page))["Inner region"].borrowed_name
+
+
+def test_success_banner_and_live_regions_are_read_as_notices(page, base_url):
+    page.goto(f"{base_url}/banner.html")
+    notices = agent.observe(page).notices
+    assert notices == ["Budget jevagent-x-budget created", "Saving complete", "Model is ready", "3 errors found"]
+
+
+def test_new_text_after_an_action_reaches_page_notices(page, base_url):
+    page.goto(f"{base_url}/reply.html")
+    before = agent.observe(page)
+    page.get_by_role("button", name="Run").click()
+    after = agent.observe(page)
+    assert agent.page_notices(after, before, {"prompt": "Reply with one word: hello"}) == "friend"
+
+
 def test_opacity_zero_radio_stays_visible(page, base_url):
     page.goto(f"{base_url}/controls.html")
     radio = next(e for e in agent.observe(page).elements if e.name == "Use an existing role")

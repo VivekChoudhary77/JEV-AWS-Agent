@@ -53,6 +53,57 @@ class FakeJev:
         return {name: self.scores.get(name, 0.0) for name in questions}
 
 
+def text_page(text, *notices, url=None):
+    page = snapshot(element(1, name="Run"))
+    page.text, page.notices = text, list(notices)
+    page.url = url or page.url
+    return page
+
+
+def test_notices_list_alerts_even_on_the_first_observation():
+    assert agent.page_notices(text_page("anything", "Saved"), None, {}) == "Saved"
+
+
+def test_notices_show_only_new_lines():
+    before, after = text_page("Heading\nBody"), text_page("Heading\nBody\nfriend\n\nBody")
+    assert agent.page_notices(after, before, {}) == "friend"
+
+
+def test_notices_skip_text_the_table_or_inputs_already_show():
+    before = text_page("Heading")
+    after = text_page("Heading\nRun\nReply with one word: hello\nfriend")
+    assert agent.page_notices(after, before, {"prompt": "Reply with one word: hello"}) == "friend"
+
+
+def test_notices_dont_repeat_an_alert_as_new_text():
+    assert agent.page_notices(text_page("Old\nSaved", "Saved"), text_page("Old"), {}) == "Saved"
+
+
+def test_a_new_url_is_a_new_page_not_new_text():
+    after = text_page("Whole new page", url="https://us-east-1.console.aws.amazon.com/lambda/other")
+    assert agent.page_notices(after, text_page("Old"), {}) == ""
+
+
+def test_a_big_jump_in_text_is_a_new_page_but_alerts_survive():
+    after = text_page("x" * (agent.MAX_NEW_TEXT_CHARS + 1), "Saved")
+    assert agent.page_notices(after, text_page("Old"), {}) == "Saved"
+
+
+def test_notices_are_capped_redacted_and_cleaned():
+    notice = "Account 111122223333 owner someone@example.com\x1b[2K " + "y" * 500
+    result = agent.page_notices(text_page("", notice), None, {})
+    assert len(result) == agent.MAX_NOTICE_CHARS
+    assert "111122223333" not in result and "someone@" not in result and "\x1b" not in result
+
+
+def test_notices_are_in_the_state_only_when_present():
+    jev = FakeJev(op="WAIT")
+    agent.decide(jev, "goal", snapshot(element(1)), [], {}, "Reply: friend")
+    agent.decide(jev, "goal", snapshot(element(1)), [], {})
+    assert jev.requests[0][1]["page_notices_untrusted"] == "Reply: friend"
+    assert "page_notices_untrusted" not in jev.requests[1][1]
+
+
 def test_click_needs_one_request_and_uses_the_target_head():
     jev = FakeJev()
     decision = agent.decide(jev, "goal", snapshot(element(1)), [], {})
@@ -415,6 +466,14 @@ def test_commit_click_requires_y(monkeypatch, tmp_path):
     assert harness.steps()[0]["gate"] == "approved"
 
 
+def test_a_control_named_only_by_an_ancestor_still_needs_approval(monkeypatch, tmp_path):
+    borrowed = element(1, name="Instances table")
+    borrowed.borrowed_name = True
+    harness = Harness(monkeypatch, tmp_path, [snapshot(borrowed)])
+    assert harness.run(FakeJev(), dry_run=True).status == "dry_run_stop"
+    assert not harness.acted
+
+
 def test_dry_run_stops_at_the_gate_without_acting(monkeypatch, tmp_path):
     harness = Harness(monkeypatch, tmp_path, [snapshot(element(1, name="Create budget"))])
     outcome = harness.run(FakeJev(), dry_run=True)
@@ -479,6 +538,21 @@ def test_step_log_has_every_required_field(monkeypatch, tmp_path, capsys):
     assert "step 01 CLICK" in capsys.readouterr().out
 
 
+def test_loop_logs_notices_and_sends_them_to_jev(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [text_page("Old"), text_page("Old\nfriend")])
+    jev = FakeJev(op="SCROLL_DOWN")
+    harness.run(jev, max_steps=2)
+    assert [step["page_notices"] for step in harness.steps()] == ["", "friend"]
+    assert jev.requests[-1][1]["page_notices_untrusted"] == "friend"
+
+
+def test_text_that_appears_during_a_wait_stays_new(monkeypatch, tmp_path):
+    pages = [text_page("Old"), text_page("Old\nfriend"), text_page("Old\nfriend")]
+    harness = Harness(monkeypatch, tmp_path, pages)
+    harness.run(FakeJev(op="WAIT"), max_steps=3)
+    assert [step["page_notices"] for step in harness.steps()] == ["", "friend", "friend"]
+
+
 def test_done_ends_the_loop(monkeypatch, tmp_path):
     harness = Harness(monkeypatch, tmp_path, [snapshot(element(1))])
     assert harness.run(FakeJev(op="DONE")).status == "done"
@@ -493,3 +567,43 @@ def test_live_noul_confirms_the_api_key():
     with TypeSafeClient() as client:
         probability = agent.Jev(client=client).noul("Is this text a greeting?", "Hello there!")
     assert 0.0 <= probability <= 1.0
+
+
+@pytest.mark.parametrize("report, expected", [
+    (["deleted budget jevagent-x-budget"], ["Teardown: deleted [budget jevagent-x-budget]"]),
+    (["deleted function a", "deleted instance b"], ["Teardown: deleted [function a, instance b]"]),
+    ([], ["Teardown: nothing to delete"]),
+    (["skipped function jevagent-x: no run ID in the name"], ["Teardown: nothing to delete"]),
+    (["FAILED budget b: AccessDenied"], ["Teardown FAILED: budget b: AccessDenied"]),
+    (["FAILED: boom; run: python verify.py teardown 1"], ["Teardown FAILED: boom; run: python verify.py teardown 1"]),
+    (["deleted budget a", "FAILED function b: AccessDenied"],
+     ["Teardown: deleted [budget a]", "Teardown FAILED: function b: AccessDenied"]),
+])
+def test_teardown_lines(report, expected):
+    assert agent.teardown_lines(report) == expected
+
+
+def fake_run(monkeypatch, tmp_path, check):
+    real_log = agent.RunLog
+    monkeypatch.setattr(agent, "preflight", lambda cdp_url: [])
+    monkeypatch.setattr(agent, "RunLog", lambda run_id: real_log(run_id, tmp_path))
+    monkeypatch.setattr(agent, "drive", lambda *args: agent.Outcome("done", snapshot(element(1))))
+    monkeypatch.setitem(agent.verify.CHECKS, "create_budget", check)
+
+
+def test_run_prints_teardown_after_the_verifier(monkeypatch, tmp_path, capsys):
+    passed = agent.verify.VerifyResult(True, "ok")
+    fake_run(monkeypatch, tmp_path, agent.verify.Check(lambda run_id, ctx: passed, lambda run_id: ["deleted budget b"]))
+    assert agent.run_task("01_create_budget") == 0
+    out = capsys.readouterr().out
+    assert out.index("Verifier passed") < out.index("Teardown: deleted [budget b]") < out.index("Finished:")
+
+
+def test_run_prints_a_teardown_failure(monkeypatch, tmp_path, capsys):
+    def boom(run_id):
+        raise RuntimeError("no credentials")
+
+    passed = agent.verify.VerifyResult(True, "ok")
+    fake_run(monkeypatch, tmp_path, agent.verify.Check(lambda run_id, ctx: passed, boom))
+    agent.run_task("01_create_budget")
+    assert "Teardown FAILED: no credentials" in capsys.readouterr().out
