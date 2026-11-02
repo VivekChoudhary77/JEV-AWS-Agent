@@ -16,13 +16,15 @@ dependencies = [
 package = false
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = [".", "scripts"]
 testpaths = ["tests"]
 addopts = "-m 'not live'"
 markers = ["live: calls a real external API; run with `uv run pytest -m live`"]
 
 [dependency-groups]
 dev = [
+    "imageio-ffmpeg>=0.7.0",
     "moto[budgets,ec2,iam,lambda,rds,sts]>=5.2.5",
+    "pillow>=12.3.0",
     "pytest>=9.2.0",
 ]
