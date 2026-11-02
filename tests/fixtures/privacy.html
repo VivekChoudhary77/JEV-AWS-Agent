@@ -14,7 +14,9 @@
   <p id="plain">Create Event Function</p>
   <p id="short-number">Port 8080 and 123456</p>
   <p id="hex-id">i-04ff9ecfd4be46b49</p>
+  <div class="monaco-editor"><span id="in-editor">arn:aws:s3:::editor</span></div>
   <div id="host"></div>
+  <iframe id="frame" srcdoc="<p id='inner'>arn:aws:s3:::frame</p>"></iframe>
   <script>
     document.getElementById("host").attachShadow({mode: "open"}).innerHTML = "<span>arn:aws:s3:::bucket</span>";
   </script>

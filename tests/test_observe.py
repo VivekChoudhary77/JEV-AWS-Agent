@@ -431,6 +431,65 @@ def test_demo_blurs_an_arn_typed_into_a_field(private_page):
     private_page.wait_for_function("getComputedStyle(document.getElementById('empty')).filter === 'blur(8px)'")
 
 
+def test_demo_keeps_observe_fast_on_a_page_that_mutates_constantly(page, base_url):
+    page.add_init_script(agent.DEMO_PRIVACY_JS)
+    page.goto(f"{base_url}/churn.html")
+    assert max(agent.observe(page).ms for _ in range(5)) < 200
+
+
+def test_demo_scanner_is_within_budget_on_a_page_that_mutates_constantly(page, base_url):
+    page.add_init_script(agent.DEMO_PRIVACY_JS)
+    page.goto(f"{base_url}/churn.html")
+    agent.demo_scan(page)
+    page.wait_for_timeout(500)
+    assert agent.demo_scan(page)["ms"] < 500 * 8 / 16  # 8 ms per ~16 ms frame is the most it may use
+
+
+def test_demo_scanner_goes_idle_on_a_quiet_page_and_never_feeds_itself(private_page):
+    private_page.wait_for_timeout(200)
+    settled = private_page.evaluate("window.__jevDemoScan.passes")
+    private_page.wait_for_timeout(300)
+    assert private_page.evaluate("window.__jevDemoScan.passes") == settled
+
+
+def test_demo_overlays_dont_wake_the_scanner(private_page):
+    private_page.wait_for_timeout(200)
+    settled = private_page.evaluate("window.__jevDemoScan.passes")
+    agent.show_overlay(private_page, agent.DEMO_HUD, agent.DEMO_HUD_CSS, "arn:aws:s3:::hud")
+    private_page.wait_for_timeout(100)
+    assert private_page.evaluate("window.__jevDemoScan.passes") <= settled + 1
+    assert not blurred(private_page, "#jev-demo-hud")
+
+
+def test_demo_skips_code_editors(private_page):
+    assert not blurred(private_page, "#in-editor")
+
+
+def test_demo_runs_only_in_the_top_frame(private_page):
+    frame = private_page.frames[1]
+    frame.wait_for_selector("#inner")
+    assert frame.evaluate("window.__jevDemoScan === undefined")
+    assert frame.evaluate("getComputedStyle(document.getElementById('inner')).filter") == "none"
+
+
+def test_demo_counts_what_it_skips_as_too_large(private_page):
+    agent.demo_scan(private_page)
+    private_page.evaluate("""() => {
+        const wide = document.createElement('div');
+        wide.id = 'wide';
+        wide.innerHTML = '<p>arn:aws:s3:::wide</p>'.repeat(1001);
+        document.body.append(wide);
+    }""")
+    private_page.wait_for_function("window.__jevDemoScan.skipped === 1")
+    assert agent.demo_scan(private_page)["skipped"] == 1
+    assert not blurred(private_page, "#wide p")
+
+
+def test_demo_scan_is_empty_on_a_page_without_the_script(page, base_url):
+    page.goto(f"{base_url}/controls.html")
+    assert agent.demo_scan(page) == {}
+
+
 def test_demo_blur_survives_navigation(private_page, base_url):
     private_page.goto(f"{base_url}/privacy.html?again=1")
     private_page.wait_for_function("getComputedStyle(document.getElementById('arn')).filter === 'blur(8px)'")

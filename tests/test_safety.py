@@ -1,5 +1,7 @@
 """Approval regex, URL rules, redaction and task schema."""
 
+import time
+
 import pytest
 from pydantic import ValidationError
 
@@ -96,6 +98,12 @@ def test_blocklisted_service_hosts():
 def test_redacts_account_ids_and_emails():
     text = agent.redact("111122223333 1111-2222-3333 someone@example.com jevagent-26103015140a3f-fn")
     assert text == "<account> <account> <email> jevagent-26103015140a3f-fn"
+
+
+def test_redaction_stays_fast_on_long_text_without_an_email():
+    started = time.perf_counter()
+    agent.redact("abcdefghij." * 40000)
+    assert time.perf_counter() - started < 0.5
 
 
 def test_clean_strips_terminal_escapes():

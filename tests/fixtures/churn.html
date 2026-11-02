@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head><title>Churn</title></head>
+<body>
+  <!-- A bundle-sized inline payload: no email in it, and nothing that should ever be scanned. -->
+  <script id="payload" type="application/json"></script>
+  <button>One</button>
+  <button>Two</button>
+  <button>Three</button>
+  <button>Four</button>
+  <button>Five</button>
+  <button>Six</button>
+  <div id="ticker">0</div>
+  <p id="long-word" style="width: 200px; overflow: hidden"></p>
+  <ul id="list"></ul>
+  <script>
+    document.getElementById("payload").textContent = "abcdefghij.".repeat(40000);
+    document.getElementById("long-word").textContent = "abcdefghij.".repeat(40000);
+    const list = document.getElementById("list"), ticker = document.getElementById("ticker");
+    let tick = 0;
+    setInterval(() => {
+      ticker.firstChild.data = String(++tick);
+      list.innerHTML = Array.from({length: 200}, (_, i) => `<li>Row ${tick}-${i}</li>`).join("");
+    }, 4);
+  </script>
+</body>
+</html>

@@ -606,6 +606,7 @@ class DemoSpy:
         monkeypatch.setattr(agent, "show_overlay", lambda page, id, css, text="": self.events.append(("show", id, text)))
         monkeypatch.setattr(agent, "hide_overlay", lambda page, id: self.events.append(("hide", id)))
         monkeypatch.setattr(agent, "demo_target", lambda page, decision: self.events.append(("target", decision.op)))
+        monkeypatch.setattr(agent, "demo_scan", lambda page: {"ms": 1.5, "skipped": 2})
         shoot = self.page.screenshot
 
         def screenshot(path, timeout, full_page):
@@ -633,10 +634,25 @@ def test_normal_runs_touch_no_overlays(monkeypatch, tmp_path):
     def forbidden(*args, **kwargs):
         pytest.fail("overlay used outside --demo")
 
-    for name in ("show_overlay", "hide_overlay", "demo_target", "demo_hud"):
+    for name in ("show_overlay", "hide_overlay", "demo_target", "demo_hud", "demo_scan"):
         monkeypatch.setattr(agent, name, forbidden)
     pages = [snapshot(element(1, name="Create budget")), snapshot(element(1))]
     Harness(monkeypatch, tmp_path, pages).run(FakeJev(), replies=["y"], max_steps=2)
+
+
+def test_demo_logs_the_scanners_work_per_step(monkeypatch, tmp_path, capsys):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1))])
+    demo_run(harness, DemoSpy(monkeypatch, harness), FakeJev())
+    record = harness.steps()[0]
+    assert (record["demo_scan_ms"], record["demo_scan_skipped"]) == (1.5, 2)
+    assert "scan=1.5ms" in capsys.readouterr().out
+
+
+def test_normal_runs_log_no_scan_time(monkeypatch, tmp_path, capsys):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1))])
+    harness.run(FakeJev(), max_steps=1)
+    assert harness.steps()[0]["demo_scan_ms"] is None
+    assert "scan=" not in capsys.readouterr().out
 
 
 def test_demo_hud_shows_step_confidence_and_latency(monkeypatch, tmp_path):

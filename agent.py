@@ -65,7 +65,7 @@ BLOCKED_PAGES = re.compile(
     r"|/bedrock.*(provisioned|custom|knowledge)"
 )
 SECRETS = [(re.compile(r"\b\d{12}\b|\b\d{4}-\d{4}-\d{4}\b"), "<account>"),
-           (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "<email>")]
+           (re.compile(r"[\w.+-]{1,64}@[\w-]{1,63}\.[\w.-]+"), "<email>")]  # bounded: unbounded backtracks
 
 
 def clean(text: str) -> str:
@@ -814,49 +814,90 @@ DEMO_SHOW_JS = r"""([id, css, text]) => {
   el.textContent = text;
 }"""
 DEMO_HIDE_JS = "id => document.getElementById(id)?.remove()"
-# Installed before the page loads, so it reaches every frame and survives navigation. Text patterns
-# do most of the work: they don't depend on the console's markup, which the menu selectors do.
+# Installed before the page loads, so it survives navigation. Text patterns do most of the work:
+# they don't depend on the console's markup, which the menu selectors do. Only nodes named by
+# mutation records are read, within a per-frame budget. Blurring writes attributes, which aren't
+# observed, and the stylesheet is in SKIP, so the scanner can't feed itself and idles on a quiet page.
 DEMO_PRIVACY_JS = r"""(() => {
-  const SECRET = /arn:aws[\w-]*:|\b\d{4}-\d{4}-\d{4}\b|\b\d{12}\b|[\w.+-]+@[\w-]+\.[\w.-]+/;
+  if (window !== window.top) return;
+  const ACCOUNT = /arn:aws[\w-]*:|\b\d{4}-\d{4}-\d{4}\b|\b\d{12}\b/;
+  // Bounded on purpose: an open-ended run before the @ backtracks quadratically on long text.
+  const EMAIL = /[\w.+-]{1,64}@[\w-]{1,63}\.[\w.-]{2,}/;
   const MENU = '#nav-usernameMenu,[data-testid="awsc-nav-account-menu-button"],' +
     '[data-testid="awsc-copy-accountid"],#menu--account';
-  const BLUR = 'blur(8px)';
+  const SKIP = 'script,style,noscript,template,iframe,frame,object,embed,canvas,svg,[data-jev-ignore],' +
+    '.monaco-editor,.ace_editor,.CodeMirror,.cm-editor';
+  const BLUR = 'blur(8px)', MAX_TEXT = 5000, MAX_CHILDREN = 1000, BUDGET_MS = 8;
+  const stats = window.__jevDemoScan = {ms: 0, skipped: 0, passes: 0};
+  const isSecret = value => {
+    const text = String(value).slice(0, MAX_TEXT);
+    return ACCOUNT.test(text) || (text.includes('@') && EMAIL.test(text));
+  };
   const blur = el => el?.style?.setProperty('filter', BLUR, 'important');
   const style = document.createElement('style');
   style.setAttribute('data-jev-ignore', '');
   style.textContent = `${MENU} { filter: ${BLUR} !important; }`;
 
-  const watched = new WeakSet();
+  const pending = new Set(), watched = new WeakSet();
   let scheduled = false;
   const schedule = () => {
     if (scheduled) return;
     scheduled = true;
-    requestAnimationFrame(() => {  // runs before the next paint
-      scheduled = false;
-      if (!style.isConnected) (document.head || document.documentElement)?.append(style);  // null at install
-      scan(document);
-    });
+    requestAnimationFrame(pass);  // runs before the next paint
+  };
+  const visit = node => {
+    if (!node.isConnected) return;
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (isSecret(node.data)) blur(node.parentElement ?? node.parentNode.host);
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE || node.matches(SKIP)) return;
+    if (node.matches(MENU) || (node.matches('input,textarea') && isSecret(node.value))) blur(node);
+    if (node.shadowRoot) {
+      watch(node.shadowRoot);
+      node.shadowRoot.childNodes.forEach(child => pending.add(child));
+    }
+    if (node.childElementCount > MAX_CHILDREN) stats.skipped += 1;
+    else node.childNodes.forEach(child => pending.add(child));
+  };
+  const pass = () => {
+    scheduled = false;
+    stats.passes += 1;
+    const started = performance.now();
+    if (!style.isConnected) (document.head || document.documentElement)?.append(style);  // null at install
+    for (const node of pending) {
+      pending.delete(node);
+      visit(node);
+      if (performance.now() - started >= BUDGET_MS) break;
+    }
+    stats.ms += performance.now() - started;
+    if (pending.size) schedule();
+  };
+  const collect = records => {
+    for (const {type, target, addedNodes} of records) {
+      const host = target.nodeType === Node.TEXT_NODE ? target.parentElement : target;
+      if (host?.closest?.(SKIP)) continue;
+      if (type === 'characterData') pending.add(target);
+      else addedNodes.forEach(node => pending.add(node));
+    }
+    schedule();
   };
   const watch = root => {
     if (watched.has(root)) return;
     watched.add(root);
-    new MutationObserver(schedule).observe(root, {childList: true, subtree: true, characterData: true});
-  };
-  const scan = root => {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
-    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-      if (n.nodeType === Node.TEXT_NODE) {
-        if (SECRET.test(n.data)) blur(n.parentElement);
-        continue;
-      }
-      if (n.matches(MENU) || SECRET.test(n.value)) blur(n);
-      if (n.shadowRoot) { watch(n.shadowRoot); scan(n.shadowRoot); }
-    }
+    new MutationObserver(collect).observe(root, {childList: true, subtree: true, characterData: true});
   };
   watch(document);
-  document.addEventListener('input', schedule, true);
+  document.addEventListener('input', event => { pending.add(event.composedPath()[0]); schedule(); }, true);
   schedule();
 })();"""
+DEMO_SCAN_JS = """() => {
+  const scan = window.__jevDemoScan;
+  if (!scan) return null;
+  const taken = {...scan};
+  scan.ms = scan.skipped = 0;
+  return taken;
+}"""
 
 
 def show_overlay(page: Page, overlay_id: str, css: str, text: str = "") -> None:
@@ -871,6 +912,14 @@ def hide_overlay(page: Page, overlay_id: str) -> None:
         page.evaluate(DEMO_HIDE_JS, overlay_id)
     except PlaywrightError:
         pass
+
+
+def demo_scan(page: Page) -> dict:
+    """The blur scanner's work since the last call."""
+    try:
+        return page.evaluate(DEMO_SCAN_JS) or {}
+    except PlaywrightError:
+        return {}
 
 
 def demo_hud(page: Page, step: int, decision: Decision, jev_ms: float) -> None:
@@ -934,7 +983,8 @@ class RunLog:
               f"conf={record['confidence']:.2f} source={record['source']} gate={record['gate']} "
               f"{record['result']} settle={record['settle_ms']:.0f}ms{'' if record['settle_reason'] == 'stable' else ' ' + record['settle_reason']} "
               f"{'noul={value:.2f}({trigger}) '.format(**record['noul_done']) if record['noul_done'] else ''}"
-              f"observe={ms['observe']:.0f}ms jev={ms['jev']:.0f}ms act={ms['act']:.0f}ms")
+              f"observe={ms['observe']:.0f}ms jev={ms['jev']:.0f}ms act={ms['act']:.0f}ms"
+              f"{'' if record['demo_scan_ms'] is None else ' scan={:.1f}ms'.format(record['demo_scan_ms'])}")
 
     def summary(self, record: dict) -> None:
         (self.dir / "summary.json").write_text(json.dumps(record, indent=2))
@@ -1050,6 +1100,7 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
         history.append({"op": decision.op, "element": row, "result": result})
         if decision.op != "WAIT" or baseline is None:  # a reply that arrives during a WAIT must stay new
             baseline = snapshot
+        scan = demo_scan(page) if limits.demo else {}
         target = decision.heads.get("target")
         human_target = clean(row) if target and target.source == "human" else None
         log.step({"step": step, "url": redact(clean(snapshot.url)), "element_count": len(snapshot.elements),
@@ -1060,6 +1111,7 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
                   "settle_reason": ("timeout" if settle_timeout else
                                     "stuck_indicator_ignored" if snapshot.stuck_indicators else "stable"),
                   "stuck_indicators": snapshot.stuck_indicators,
+                  "demo_scan_ms": scan.get("ms"), "demo_scan_skipped": scan.get("skipped"),
                   "latency_ms": {"observe": snapshot.ms, "jev": jev_ms, "act": act_ms},
                   "screenshot": screenshot, "gate_screenshot": gate_screenshot, "model": jev.model,
                   "usage_cost": jev.take_cost()})
