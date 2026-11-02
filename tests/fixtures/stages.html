@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head><title>Stages</title></head>
+<body>
+  <nav>
+    <button>Services</button>
+    <button>Search</button>
+    <button>Notifications</button>
+    <button>Help</button>
+    <button>Settings</button>
+    <button>Account</button>
+  </nav>
+  <script>
+    const pause = Number(new URLSearchParams(location.search).get("pause"));
+    if (pause) setTimeout(() => {
+      document.body.insertAdjacentHTML("beforeend", `
+        <main>
+          <label>Function name <input></label>
+          <button>Create Event Function</button>
+        </main>`);
+    }, pause);
+  </script>
+</body>
+</html>

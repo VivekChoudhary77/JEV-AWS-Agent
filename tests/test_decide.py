@@ -2,6 +2,7 @@
 
 import json
 import os
+import types
 
 import httpx2
 import pytest
@@ -14,8 +15,8 @@ import agent
 INPUTS = {"budget_name": "jevagent-x-budget", "budget_amount": "1"}
 
 
-def element(idx, role="button", name="Next", tag="button", editable=False, href="", value=""):
-    return agent.Element(idx, role, name, tag, "", value, editable, href, {})
+def element(idx, role="button", name="Next", tag="button", editable=False, href="", value="", disclosure=False):
+    return agent.Element(idx, role, name, tag, "", value, editable, href, {}, disclosure=disclosure)
 
 
 def snapshot(*elements, url="https://us-east-1.console.aws.amazon.com/lambda/home"):
@@ -263,10 +264,12 @@ class Harness:
         monkeypatch.setattr(agent, "settle", lambda page: (next(self.snapshots), 12.0, False))
         monkeypatch.setattr(agent, "act", lambda page, decision: self.acted.append(decision))
 
-    def run(self, jev, replies=(), dry_run=False, inputs=INPUTS, max_steps=5, done_when="Reply is shown."):
+    def run(self, jev, replies=(), dry_run=False, inputs=INPUTS, max_steps=5, done_when="Reply is shown.",
+            ready_when="", ungated=()):
         answers = iter(replies)
-        limits = agent.Limits(max_steps, 0.7, dry_run)
-        return agent.run_loop(self.page, jev, "goal", inputs, self.log, limits, lambda text: next(answers), done_when)
+        limits = agent.Limits(max_steps, 0.7, dry_run, tuple(ungated))
+        return agent.run_loop(self.page, jev, "goal", inputs, self.log, limits, lambda text: next(answers),
+                              done_when, ready_when)
 
     def steps(self):
         return [json.loads(line) for line in (self.log.dir / "steps.jsonl").read_text().splitlines()]
@@ -486,6 +489,261 @@ def test_a_control_named_only_by_an_ancestor_still_needs_approval(monkeypatch, t
     assert not harness.acted
 
 
+def test_opening_a_dropdown_named_with_a_commit_word_needs_no_approval(monkeypatch, tmp_path):
+    toggle = element(1, name="Create options", disclosure=True)
+    harness = Harness(monkeypatch, tmp_path, [snapshot(toggle)])
+    jev = FakeJev()
+    harness.run(jev, max_steps=1)
+    assert len(harness.acted) == 1
+    assert harness.steps()[0]["gate"] == "not_required"
+    assert not jev.readiness_asks
+
+
+def test_a_radio_named_with_a_commit_word_needs_no_approval(monkeypatch, tmp_path):
+    radio = element(1, "radio", "Create security group", "input")
+    harness = Harness(monkeypatch, tmp_path, [snapshot(radio)])
+    harness.run(FakeJev(), max_steps=1)
+    assert harness.steps()[0]["gate"] == "not_required"
+
+
+def real_task_labels(task_id):
+    return agent.load_task(task_id).ungated_labels
+
+
+def test_a_listed_label_is_exempt_with_no_prompt_or_checks(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1, name="Save")), snapshot(element(1))])
+    jev = FakeJev()
+    harness.run(jev, max_steps=2, ungated=real_task_labels("03_lambda_function_url"))
+    first = harness.steps()[0]
+    assert first["gate"] == "exempt"
+    assert first["gate_screenshot"] is None and first["readiness"] is None
+    assert len(harness.acted) == 2
+    assert not jev.readiness_asks and not jev.nouls
+
+
+@pytest.mark.parametrize("task_id", ["01_create_budget", "04_ec2_launch_t3micro", "05_bedrock_playground_prompt"])
+def test_save_stays_gated_on_other_tasks(monkeypatch, tmp_path, task_id):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1, name="Save"))])
+    outcome = harness.run(FakeJev(), replies=["n"], ungated=real_task_labels(task_id))
+    assert outcome.status == "denied"
+    assert not harness.acted
+
+
+@pytest.mark.parametrize("name", ["Create Event Function", "Save changes", "save", "SAVE", "Save role"])
+def test_only_an_exact_label_is_exempt(monkeypatch, tmp_path, name):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1, name=name))])
+    outcome = harness.run(FakeJev(), replies=["n"], ungated=real_task_labels("03_lambda_function_url"))
+    assert outcome.status == "denied"
+    assert not harness.acted
+
+
+def test_a_save_named_only_by_an_ancestor_stays_gated(monkeypatch, tmp_path):
+    borrowed = element(1, name="Save")
+    borrowed.borrowed_name = True
+    harness = Harness(monkeypatch, tmp_path, [snapshot(borrowed)])
+    assert harness.run(FakeJev(), replies=["n"], ungated=["Save"]).status == "denied"
+
+
+def test_an_unnamed_control_cant_be_exempted(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1, name=""))])
+    assert harness.run(FakeJev(), replies=["n"], ungated=[""]).status == "denied"
+
+
+def test_dry_run_clicks_past_an_exempt_save_and_stops_at_the_real_gate(monkeypatch, tmp_path):
+    pages = [snapshot(element(1, name="Save")), snapshot(element(1, name="Create Event Function"))]
+    harness = Harness(monkeypatch, tmp_path, pages)
+    outcome = harness.run(FakeJev(), dry_run=True, ungated=["Save"])
+    assert outcome.status == "dry_run_stop"
+    assert [step["gate"] for step in harness.steps()] == ["exempt", "dry_run_stop"]
+    assert len(harness.acted) == 1
+
+
+def panel_page(*elements, name="Configure custom execution role"):
+    page = snapshot(*elements)
+    page.open_panel = name
+    return page
+
+
+def test_open_panel_is_in_the_state_only_when_a_panel_is_open(monkeypatch):
+    jev = FakeJev(op="WAIT")
+    agent.decide(jev, "goal", panel_page(element(1)), [], {})
+    agent.decide(jev, "goal", snapshot(element(1)), [], {})
+    assert jev.requests[0][1]["open_panel"] == "Configure custom execution role"
+    assert "open_panel" not in jev.requests[1][1]
+
+
+def test_open_panel_text_is_truncated_and_redacted():
+    jev = FakeJev(op="WAIT")
+    agent.decide(jev, "goal", panel_page(element(1), name="111122223333 " + "x" * 200), [], {})
+    heading = jev.requests[0][1]["open_panel"]
+    assert "111122223333" not in heading
+    assert len(heading) == agent.MAX_NAME
+
+
+def test_open_panel_reaches_the_completion_check_and_the_log(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [panel_page(element(1))])
+    jev = FakeJev(op=low_done(), noul=0.9)
+    harness.run(jev)
+    assert jev.nouls[0][1]["open_panel"] == "Configure custom execution role"
+    assert harness.steps()[0]["open_panel"] == "Configure custom execution role"
+
+
+def test_panel_rows_stay_first_when_the_table_is_shortlisted():
+    scores = {str(i): 3.0 for i in range(1, 51)}
+    rows = [element(i + 300, name=f"Panel {i}") for i in range(1, 3)] + [element(i, name=f"Row {i}") for i in range(1, 300)]
+    jev = FakeJev(op="WAIT", scores={"301": 3.0, "302": 3.0, **scores})
+    agent.decide(jev, "goal", panel_page(*rows), [], {})
+    table = jev.requests[0][1]["elements"].splitlines()
+    assert table[0].startswith("[301]") and table[1].startswith("[302]")
+
+
+class DemoSpy:
+    """Records overlay calls in order, alongside the prompts and screenshots they must fit between."""
+
+    def __init__(self, monkeypatch, harness):
+        self.events = []
+        self.page = harness.page
+        monkeypatch.setattr(agent, "show_overlay", lambda page, id, css, text="": self.events.append(("show", id, text)))
+        monkeypatch.setattr(agent, "hide_overlay", lambda page, id: self.events.append(("hide", id)))
+        monkeypatch.setattr(agent, "demo_target", lambda page, decision: self.events.append(("target", decision.op)))
+        shoot = self.page.screenshot
+
+        def screenshot(path, timeout, full_page):
+            shoot(path, timeout, full_page)
+            self.events.append(("shot", path.rsplit("/", 1)[-1]))
+
+        monkeypatch.setattr(self.page, "screenshot", screenshot)
+
+    def named(self, *ids):
+        return [event for event in self.events if event[0] in ("target", "prompt") or event[1] in ids]
+
+
+def demo_run(harness, spy, jev, replies=(), **kwargs):
+    answers = iter(replies)
+
+    def ask(text):
+        spy.events.append(("prompt",))
+        return next(answers)
+
+    limits = agent.Limits(kwargs.pop("max_steps", 1), 0.7, kwargs.pop("dry_run", False), (), True)
+    return agent.run_loop(harness.page, jev, "goal", INPUTS, harness.log, limits, ask, "Done.")
+
+
+def test_normal_runs_touch_no_overlays(monkeypatch, tmp_path):
+    def forbidden(*args, **kwargs):
+        pytest.fail("overlay used outside --demo")
+
+    for name in ("show_overlay", "hide_overlay", "demo_target", "demo_hud"):
+        monkeypatch.setattr(agent, name, forbidden)
+    pages = [snapshot(element(1, name="Create budget")), snapshot(element(1))]
+    Harness(monkeypatch, tmp_path, pages).run(FakeJev(), replies=["y"], max_steps=2)
+
+
+def test_demo_hud_shows_step_confidence_and_latency(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1))])
+    spy = DemoSpy(monkeypatch, harness)
+    monkeypatch.setattr(agent.time, "perf_counter", iter([0.0, 0.132] + [1.0] * 20).__next__)
+    demo_run(harness, spy, FakeJev())
+    assert ("show", agent.DEMO_HUD, "Step 1 · Jev 0.95 · 132 ms") in spy.events
+
+
+def test_demo_banner_wraps_the_prompt_and_the_outline_follows_approval(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1, name="Create budget"))])
+    spy = DemoSpy(monkeypatch, harness)
+    demo_run(harness, spy, FakeJev(), replies=["y"])
+    assert spy.named(agent.DEMO_BANNER) == [
+        ("show", agent.DEMO_BANNER, "Waiting for human approval"), ("prompt",), ("hide", agent.DEMO_BANNER),
+        ("target", "CLICK")]
+
+
+def test_demo_gate_screenshot_is_taken_before_the_banner(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1, name="Create budget"))])
+    spy = DemoSpy(monkeypatch, harness)
+    demo_run(harness, spy, FakeJev(), replies=["n"])
+    assert spy.events.index(("shot", "step_01_gate.png")) < spy.events.index(
+        ("show", agent.DEMO_BANNER, "Waiting for human approval"))
+
+
+def test_demo_denied_click_is_never_outlined(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1, name="Create budget"))])
+    spy = DemoSpy(monkeypatch, harness)
+    assert demo_run(harness, spy, FakeJev(), replies=["n"]).status == "denied"
+    assert not [event for event in spy.events if event[0] == "target"]
+    assert ("hide", agent.DEMO_BANNER) in spy.events
+
+
+def test_demo_dry_run_shows_no_banner_because_nobody_is_asked(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1, name="Create budget"))])
+    spy = DemoSpy(monkeypatch, harness)
+    demo_run(harness, spy, FakeJev(), dry_run=True)
+    assert not spy.named(agent.DEMO_BANNER)
+
+
+def test_demo_click_with_no_gate_is_outlined_without_a_banner(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1))])
+    spy = DemoSpy(monkeypatch, harness)
+    demo_run(harness, spy, FakeJev())
+    assert spy.named(agent.DEMO_BANNER) == [("target", "CLICK")]
+
+
+def test_demo_wait_has_no_target_to_outline(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1))])
+    spy = DemoSpy(monkeypatch, harness)
+    demo_run(harness, spy, FakeJev(op="WAIT"))
+    assert not [event for event in spy.events if event[0] == "target"]
+
+
+@pytest.mark.parametrize("demo, scripts", [(False, 0), (True, 1)])
+def test_only_demo_installs_the_privacy_script(monkeypatch, tmp_path, demo, scripts):
+    page = types.SimpleNamespace(installed=[], goto=lambda url: None)
+    page.add_init_script = page.installed.append
+    browser = types.SimpleNamespace(contexts=[types.SimpleNamespace(new_page=lambda: page)])
+    chromium = types.SimpleNamespace(connect_over_cdp=lambda url: browser)
+    driver = types.SimpleNamespace(start=lambda: types.SimpleNamespace(chromium=chromium, stop=lambda: None))
+    monkeypatch.setattr(agent, "sync_playwright", lambda: driver)
+    monkeypatch.setattr(agent, "Jev", lambda model: None)
+    monkeypatch.setattr(agent, "run_loop", lambda *args: agent.Outcome("done"))
+    task = agent.load_task("00_read_budget")
+    agent.drive(task, "goal", {}, "done", None, agent.Limits(1, 0.7, demo=demo), "http://cdp", input)
+    assert len(page.installed) == scripts
+
+
+@pytest.mark.parametrize("argv, demo", [([], False), (["--demo"], True)])
+def test_demo_flag_is_off_by_default(monkeypatch, argv, demo):
+    seen = {}
+    monkeypatch.setattr(agent, "load_dotenv", lambda path: None)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr("sys.argv", ["agent.py", "00_read_budget", *argv])
+    monkeypatch.setattr(agent, "run_task", lambda task_id, dry_run, demo: seen.update(demo=demo) or 0)
+    agent.main()
+    assert seen["demo"] is demo
+
+
+def test_ready_when_is_waited_for_once_before_the_first_observation(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1)), snapshot(element(1))])
+    waited = []
+    monkeypatch.setattr(agent, "wait_ready", lambda page, name: waited.append(name) or (500.0, False))
+    harness.run(FakeJev(), max_steps=2, ready_when="Function name")
+    assert waited == ["Function name"]
+    first, second = harness.steps()
+    assert (first["settle_ms"], first["settle_timeout"]) == (512.0, False)
+    assert second["settle_ms"] == 12.0
+
+
+def test_a_missing_ready_element_logs_a_timeout_and_continues(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1))])
+    monkeypatch.setattr(agent, "wait_ready", lambda page, name: (15000.0, True))
+    harness.run(FakeJev(), max_steps=1, ready_when="Function name")
+    assert harness.steps()[0]["settle_timeout"] is True
+    assert len(harness.acted) == 1
+
+
+def test_no_ready_when_means_no_extra_wait(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1))])
+    monkeypatch.setattr(agent, "wait_ready", lambda page, name: pytest.fail("shouldn't wait"))
+    harness.run(FakeJev(), max_steps=1)
+
+
 def test_dry_run_stops_at_the_gate_without_acting(monkeypatch, tmp_path):
     harness = Harness(monkeypatch, tmp_path, [snapshot(element(1, name="Create budget"))])
     outcome = harness.run(FakeJev(), dry_run=True)
@@ -658,6 +916,75 @@ def test_one_step_never_asks_the_same_noul_twice(monkeypatch, tmp_path):
     harness.run(jev, replies=["y", "a"])
     assert len(jev.nouls) == 1
     assert harness.acted
+
+
+def scripted_jev(*ops, nouls=()):
+    """Answers each op question from `ops` in turn, and each completion check from `nouls`."""
+    jev = FakeJev()
+    planned, values, choose_many, noul = iter(ops), iter(nouls), jev.choose_many, jev.noul
+
+    def next_op(questions, state):
+        jev.script["op"] = next(planned)
+        return choose_many(questions, state)
+
+    def next_noul(question, state):
+        jev.noul_value = next(values, 0.1) if question != agent.READINESS_QUESTION else None
+        return noul(question, state)
+
+    jev.choose_many, jev.noul = next_op, next_noul
+    return jev
+
+
+def run_pages(count):
+    return [snapshot(element(1, name="Run")) for _ in range(count)]
+
+
+def triggers(harness):
+    return [step["noul_done"]["trigger"] if step["noul_done"] else None for step in harness.steps()]
+
+
+def test_check_repeats_after_a_wait_until_the_result_lands(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, run_pages(4))
+    jev = scripted_jev("CLICK", "WAIT", "WAIT", nouls=[0.02, 0.1, 0.9])
+    assert harness.run(jev, replies=["y"]).status == "done"
+    assert triggers(harness) == [None, "after_gate", "after_wait", "after_wait"]
+    assert harness.steps()[-1]["source"] == "jev_noul"
+
+
+def test_check_stops_after_three_waits(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, run_pages(7))
+    jev = scripted_jev("CLICK", *["WAIT"] * 6)
+    harness.run(jev, replies=["y"], max_steps=7)
+    assert triggers(harness) == [None, "after_gate", "after_wait", "after_wait", "after_wait", None, None]
+
+
+def test_a_wait_with_no_approved_click_before_it_gets_no_check(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, run_pages(3))
+    jev = scripted_jev("WAIT", "WAIT", "WAIT")
+    harness.run(jev, max_steps=3)
+    assert not jev.nouls
+
+
+def test_an_operation_other_than_wait_gets_no_check(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, run_pages(3))
+    jev = scripted_jev("CLICK", "SCROLL_DOWN", "SCROLL_DOWN")
+    harness.run(jev, replies=["y"], max_steps=3)
+    assert triggers(harness) == [None, "after_gate", None]
+
+
+def test_a_scroll_between_waits_keeps_the_remaining_checks(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, run_pages(5))
+    jev = scripted_jev("CLICK", "WAIT", "SCROLL_DOWN", "WAIT", "WAIT")
+    harness.run(jev, replies=["y"], max_steps=5)
+    assert triggers(harness) == [None, "after_gate", "after_wait", None, "after_wait"]
+
+
+def test_another_approved_click_restarts_the_wait_checks(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, run_pages(8))
+    jev = scripted_jev("CLICK", "WAIT", "WAIT", "WAIT", "CLICK", "WAIT", "WAIT", "WAIT")
+    harness.run(jev, replies=["y", "y"], max_steps=8)
+    assert triggers(harness) == [None, "after_gate", "after_wait", "after_wait", "after_wait",
+                                 "after_gate", "after_wait", "after_wait"]
 
 
 def test_no_check_after_a_click_that_needed_no_approval(monkeypatch, tmp_path):

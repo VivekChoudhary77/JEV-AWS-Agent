@@ -32,12 +32,15 @@
 - id: 03_lambda_function_url
   enabled: true
   goal: >-
-    Create a Lambda function from scratch named {function_name}. Open the Runtime
-    dropdown and change it from the default to {runtime}. Under Additional settings,
-    turn on "Custom execution role" and select the existing role {existing_role_name}.
-    Also under Additional settings, enable the function URL (it may be listed under
-    HTTP(S) endpoints) with auth type AWS_IAM, never NONE. Then create the function.
-  done_when: "A banner says the function {function_name} was created successfully."
+    Type {function_name} as the Function name. Open the Runtime dropdown and choose
+    {runtime}. Expand "Additional settings". Turn on "Custom execution role"; in the
+    "Configure custom execution role" panel, open "Choose an existing role", select
+    {existing_role_name}, and click "Save" in that panel. Then turn on "Function URL";
+    if a panel opens, choose Auth type "AWS_IAM" and click "Save" in that panel.
+    Then click "Create Event Function".
+  done_when: 'A banner says "Successfully created the function {function_name}".'
+  ready_when: "Function name"
+  ungated_labels: ["Save"]
   start_url: "https://us-east-1.console.aws.amazon.com/lambda/home?region=us-east-1#/create/function"
   inputs:
     function_name: "jevagent-{run_id}-fn"
@@ -55,7 +58,7 @@
     "Proceed without a key pair". In "Network settings", choose
     "Select existing security group" and select the security group named default.
     Then click Launch instance.
-  done_when: "A banner says the instance launch succeeded."
+  done_when: 'A banner says "Successfully initiated launch of instance".'
   start_url: "https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#LaunchInstances:"
   inputs:
     instance_name: "jevagent-{run_id}-ec2"

@@ -3,6 +3,7 @@
 import functools
 import http.server
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -213,6 +214,205 @@ def test_a_stable_empty_table_is_not_settled(page, monkeypatch):
     assert ms >= 700
 
 
+def test_settle_outlasts_a_short_pause_between_render_stages(page, base_url, monkeypatch):
+    monkeypatch.setattr(agent, "blocked_reason", lambda url: None)
+    page.goto(f"{base_url}/stages.html?pause=450")
+    assert "Function name" not in names(agent.observe(page))
+    snapshot, _, timed_out = agent.settle(page)
+    assert "Function name" in names(snapshot)
+    assert not timed_out
+
+
+def test_settle_alone_cant_outlast_a_long_pause_so_ready_when_waits(page, base_url, monkeypatch):
+    monkeypatch.setattr(agent, "blocked_reason", lambda url: None)
+    page.goto(f"{base_url}/stages.html?pause=1500")
+    assert "Function name" not in names(agent.settle(page)[0])
+    ms, timed_out = agent.wait_ready(page, "function NAME")
+    assert not timed_out
+    assert "Function name" in names(agent.settle(page)[0])
+    assert ms > 0
+
+
+def test_wait_ready_gives_up_at_the_cap(page, base_url, monkeypatch):
+    monkeypatch.setattr(agent, "blocked_reason", lambda url: None)
+    monkeypatch.setattr(agent, "READY_CAP_S", 0.4)
+    page.goto(f"{base_url}/stages.html")
+    ms, timed_out = agent.wait_ready(page, "Function name")
+    assert timed_out
+    assert ms >= 400
+
+
+def test_settle_waits_for_aria_busy_to_clear(page, base_url, monkeypatch):
+    monkeypatch.setattr(agent, "blocked_reason", lambda url: None)
+    page.goto(f"{base_url}/loading.html?kind=busy&clear=1000")
+    assert agent.observe(page).loading
+    snapshot, ms, timed_out = agent.settle(page)
+    assert not snapshot.loading
+    assert not timed_out
+    assert ms >= 900
+
+
+@pytest.mark.parametrize("kind, loading", [
+    ("busy", True), ("progressbar", True), ("progress", True), ("spinner", True), ("status", True),
+    ("idle", False), ("hidden", False), ("finished", False), ("in_progress", False),
+])
+def test_observe_reports_loading_indicators(page, base_url, kind, loading):
+    page.goto(f"{base_url}/loading.html?kind={kind}")
+    assert agent.observe(page).loading is loading
+
+
+def test_a_loading_indicator_that_never_clears_times_out(page, base_url, monkeypatch):
+    monkeypatch.setattr(agent, "blocked_reason", lambda url: None)
+    monkeypatch.setattr(agent, "SETTLE_CAP_S", 0.7)
+    page.goto(f"{base_url}/loading.html?kind=spinner")
+    snapshot, _, timed_out = agent.settle(page)
+    assert snapshot.loading
+    assert timed_out
+
+
+@pytest.mark.parametrize("kind, heading", [
+    ("dialog", "Close side panel"),
+    ("alert", "Are you sure?"),
+    ("modal", "Confirm"),
+    ("split", "Configure custom execution role"),
+    ("toolbar", "Details"),
+    ("labelled", "Panel label"),
+    ("untitled", "Untitled panel"),
+])
+def test_open_panel_is_named_and_listed_first(page, base_url, kind, heading):
+    page.goto(f"{base_url}/panels.html?kind={kind}")
+    snapshot = agent.observe(page)
+    assert snapshot.open_panel == heading
+    assert names(snapshot) == ["In panel", "Page button", "Other page button"]
+    assert snapshot.elements[0].idx == 3
+
+
+@pytest.mark.parametrize("kind", ["none", "hidden", "closed", "nav"])
+def test_no_open_panel_leaves_the_table_alone(page, base_url, kind):
+    page.goto(f"{base_url}/panels.html?kind={kind}")
+    snapshot = agent.observe(page)
+    assert snapshot.open_panel == ""
+    assert names(snapshot)[:2] == ["Page button", "Other page button"]
+
+
+def test_a_modal_takes_priority_over_the_panel_beneath_it(page, base_url):
+    page.goto(f"{base_url}/panels.html?kind=stacked")
+    snapshot = agent.observe(page)
+    assert snapshot.open_panel == "Close side panel"
+    assert names(snapshot)[0] == "In dialog"
+
+
+def test_a_panel_element_keeps_its_stamped_index_for_act(page, base_url):
+    page.goto(f"{base_url}/panels.html?kind=dialog")
+    page.evaluate("() => { document.querySelector('[role=dialog] button').onclick = e => { e.target.dataset.clicked = 'yes'; }; }")
+    agent.act(page, decision(agent.observe(page), "CLICK", "In panel"))
+    assert page.evaluate("document.querySelector('[role=dialog] button').dataset.clicked") == "yes"
+
+
+def test_overlay_elements_are_excluded_from_observation(page, base_url):
+    page.goto(f"{base_url}/overlay.html")
+    snapshot = agent.observe(page)
+    assert names(snapshot) == ["Real button"]
+    assert snapshot.notices == ["Real alert"]
+    assert not snapshot.loading
+    assert snapshot.open_panel == ""
+    assert "Overlay" not in snapshot.text
+    assert "Real text" in snapshot.text
+    assert page.evaluate("getComputedStyle(document.querySelector('[data-jev-ignore]')).display") == "block"
+    assert page.locator("[data-jev-idx]").count() == 1
+
+
+def test_demo_overlays_change_nothing_jev_or_the_verifier_sees(page, base_url):
+    page.goto(f"{base_url}/controls.html")
+    before = agent.observe(page)
+    agent.show_overlay(page, agent.DEMO_HUD, agent.DEMO_HUD_CSS, "Step 7 · Jev 0.94 · 132 ms")
+    agent.show_overlay(page, agent.DEMO_BANNER, agent.DEMO_BANNER_CSS, "Waiting for human approval")
+    agent.show_overlay(page, agent.DEMO_LABEL, agent.DEMO_LABEL_CSS, "CLICK  Next  0.98")
+    assert page.locator("[data-jev-ignore]").count() == 3
+    after = agent.observe(page)
+    assert after.table == before.table
+    assert after.text == before.text
+    assert after.notices == before.notices
+    assert agent.page_notices(after, before, {}) == ""
+
+
+def test_demo_target_outlines_then_cleans_up_before_the_action(page, base_url):
+    page.goto(f"{base_url}/controls.html")
+    target = decision(agent.observe(page), "CLICK", "Next")
+    target.heads = {"op": agent.Answer("CLICK", {"CLICK": 0.98}, 0.98)}
+    shown = []
+    page.expose_function("noteLabel", shown.append)
+    page.evaluate("""() => new MutationObserver(() => {
+        const label = document.getElementById('jev-demo-label');
+        if (label?.textContent) noteLabel(label.textContent);
+    }).observe(document.body, {childList: true, subtree: true, characterData: true})""")
+    started = time.perf_counter()
+    agent.demo_target(page, target)
+    assert time.perf_counter() - started >= agent.DEMO_TARGET_MS / 1000
+    assert "CLICK  Next  0.98" in shown
+    assert page.locator("[data-jev-ignore]").count() == 0
+
+
+def test_an_overlay_on_top_of_the_target_doesnt_block_the_click(page, base_url):
+    page.goto(f"{base_url}/controls.html")
+    target = decision(agent.observe(page), "CLICK", "Next")
+    page.evaluate("document.getElementById('next').onclick = e => { e.target.dataset.clicked = 'yes'; }")
+    box = page.locator("#next").bounding_box()
+    agent.show_overlay(page, agent.DEMO_OUTLINE, f"left:{box['x']}px;top:{box['y']}px;width:{box['width']}px;"
+                                                 f"height:{box['height']}px;background:#000;")
+    agent.act(page, target)
+    assert page.evaluate("document.getElementById('next').dataset.clicked") == "yes"
+
+
+def test_demo_target_survives_an_element_that_vanished(page, base_url):
+    page.goto(f"{base_url}/controls.html")
+    target = decision(agent.observe(page), "CLICK", "Next")
+    page.evaluate("document.getElementById('next').remove()")
+    agent.demo_target(page, target)
+
+
+def blurred(page, selector):
+    return page.evaluate("s => getComputedStyle(document.querySelector(s)).filter", selector) == "blur(8px)"
+
+
+@pytest.fixture
+def private_page(page, base_url):
+    page.add_init_script(agent.DEMO_PRIVACY_JS)
+    page.goto(f"{base_url}/privacy.html")
+    page.wait_for_function("() => new Promise(requestAnimationFrame).then(() => true)")
+    return page
+
+
+@pytest.mark.parametrize("selector", ["#nav-usernameMenu", "#testid", "#account", "#account-plain", "#arn", "#field"])
+def test_demo_blurs_account_details_and_arns(private_page, selector):
+    assert blurred(private_page, selector)
+
+
+@pytest.mark.parametrize("selector", ["#plain", "#short-number", "#hex-id"])
+def test_demo_leaves_ordinary_text_alone(private_page, selector):
+    assert not blurred(private_page, selector)
+
+
+def test_demo_blurs_inside_shadow_dom(private_page):
+    assert private_page.evaluate(
+        "getComputedStyle(document.getElementById('host').shadowRoot.querySelector('span')).filter") == "blur(8px)"
+
+
+def test_demo_blurs_an_arn_that_appears_later(private_page):
+    private_page.evaluate("document.getElementById('plain').insertAdjacentHTML('afterend', '<p id=late>arn:aws:s3:::x</p>')")
+    private_page.wait_for_function("getComputedStyle(document.getElementById('late')).filter === 'blur(8px)'")
+
+
+def test_demo_blurs_an_arn_typed_into_a_field(private_page):
+    private_page.fill("#empty", "arn:aws:iam::111122223333:role/x")
+    private_page.wait_for_function("getComputedStyle(document.getElementById('empty')).filter === 'blur(8px)'")
+
+
+def test_demo_blur_survives_navigation(private_page, base_url):
+    private_page.goto(f"{base_url}/privacy.html?again=1")
+    private_page.wait_for_function("getComputedStyle(document.getElementById('arn')).filter === 'blur(8px)'")
+
+
 def test_capture_writes_a_real_png(page, base_url, tmp_path):
     page.goto(f"{base_url}/controls.html")
     path = tmp_path / "step_01.png"
@@ -266,41 +466,53 @@ def scripted(monkeypatch):
     return script
 
 
-def test_settle_needs_two_identical_observations(scripted):
-    seen = scripted(table(6), table(7), table(7))
+def test_settle_needs_three_identical_observations(scripted):
+    seen = scripted(table(6), table(7), table(7), table(7))
     snapshot, _, timed_out = agent.settle(ScriptedPage())
-    assert len(seen) == 3
+    assert len(seen) == 4
     assert len(snapshot.elements) == 7
     assert not timed_out
 
 
 def test_settle_never_accepts_an_empty_or_near_empty_table(scripted):
-    seen = scripted(table(0), table(0), table(4), table(4), table(9), table(9))
+    seen = scripted(table(0), table(0), table(0), table(4), table(4), table(4), table(9), table(9), table(9))
     snapshot, _, _ = agent.settle(ScriptedPage())
-    assert len(seen) == 6
+    assert len(seen) == 9
     assert len(snapshot.elements) == 9
 
 
 def test_settle_restarts_when_only_the_url_changes(scripted):
     overview = ScriptedPage.url + "#/budgets/overview"
-    seen = scripted(table(6), table(6, overview), table(6, overview))
+    seen = scripted(table(6), table(6), table(6, overview), table(6, overview), table(6, overview))
     snapshot, _, _ = agent.settle(ScriptedPage())
-    assert len(seen) == 3
+    assert len(seen) == 5
     assert snapshot.url == overview
 
 
 def test_settle_restarts_when_labels_change_but_the_count_does_not(scripted):
     changed = table(6)
     changed.elements[0].name = "Loaded"
-    seen = scripted(table(6), changed, changed)
+    seen = scripted(table(6), table(6), changed, changed, changed)
     agent.settle(ScriptedPage())
-    assert len(seen) == 3
+    assert len(seen) == 5
 
 
 def test_settle_treats_a_navigation_mid_read_as_unsettled(scripted):
-    seen = scripted(table(6), agent.PlaywrightError("context destroyed"), table(6), table(6))
+    seen = scripted(table(6), table(6), agent.PlaywrightError("context destroyed"), table(6), table(6), table(6))
     agent.settle(ScriptedPage())
-    assert len(seen) == 4
+    assert len(seen) == 6
+
+
+def loading_table():
+    return agent.Snapshot(ScriptedPage.url, "Title", "", table(6).elements, loading=True)
+
+
+def test_settle_restarts_the_count_once_loading_clears(scripted):
+    seen = scripted(*[loading_table() for _ in range(4)], table(6), table(6), table(6))
+    snapshot, _, timed_out = agent.settle(ScriptedPage())
+    assert len(seen) == 7
+    assert not snapshot.loading
+    assert not timed_out
 
 
 def test_settle_observes_anyway_at_the_cap_and_reports_the_timeout(scripted, monkeypatch):
@@ -382,6 +594,29 @@ def test_act_refuses_an_element_that_changed_after_the_gate(page, base_url):
     page.evaluate("document.getElementById('next').textContent = 'Delete everything'")
     with pytest.raises(agent.ActionError, match="changed"):
         agent.act(page, decision(snapshot, "CLICK", "Next"))
+
+
+def test_act_refuses_a_toggle_that_stopped_being_one_after_the_gate(page, base_url):
+    page.goto(f"{base_url}/toggles.html")
+    snapshot = agent.observe(page)
+    page.evaluate("document.querySelector('[aria-expanded]').removeAttribute('aria-expanded')")
+    with pytest.raises(agent.ActionError, match="changed"):
+        agent.act(page, decision(snapshot, "CLICK", "Runtime Node.js 24.x"))
+
+
+@pytest.mark.parametrize("name, gated", [
+    ("Runtime Node.js 24.x", False),
+    ("Create options", False),
+    ("Delete options", False),
+    ("Create security group", False),
+    ("Run", True),  # aria-haspopup="false" isn't a popup
+    ("Create Event Function", True),
+    ("Terminate instance", True),
+    ("Create log group", True),
+])
+def test_gate_on_real_controls(page, base_url, name, gated):
+    page.goto(f"{base_url}/toggles.html")
+    assert agent.needs_gate(decision(agent.observe(page), "CLICK", name)) is gated
 
 
 def test_act_reports_an_element_that_disappeared(page, base_url):

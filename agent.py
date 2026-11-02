@@ -20,7 +20,7 @@ from urllib.request import urlopen
 import yaml
 from dotenv import load_dotenv
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Locator, Page, sync_playwright
 from pydantic import BaseModel, model_validator
 from typesafe_sdk import Choice, Noul, Score, TypeSafeClient, TypeSafeError
 
@@ -36,9 +36,12 @@ SHORTLIST = 50
 SCORE_BATCH = 100
 ACT_TIMEOUT_MS = 5000
 NOUL_DONE_THRESHOLD = 0.8
+MAX_WAIT_CHECKS = 3
 READINESS_THRESHOLD = 0.8
 SETTLE_POLL_MS = 300
 SETTLE_CAP_S = 10
+SETTLE_OBSERVATIONS = 3
+READY_CAP_S = 15
 MIN_SETTLED_ELEMENTS = 5
 WAIT_MS = 1000
 SCROLL_PX = 600
@@ -49,7 +52,7 @@ MAX_ERROR_CHARS = 300
 # Safety rules
 
 COMMIT_RE = re.compile(
-    r"create|launch|submit|delete|terminate|confirm|purchase|subscribe|upgrade|run|save", re.IGNORECASE
+    r"\b(create|launch|submit|delete|terminate|confirm|purchase|subscribe|upgrade|run|save)\b", re.IGNORECASE
 )
 CONSOLE_SUFFIX = ".console.aws.amazon.com"
 REGION_LABEL = re.compile(r"[a-z]{2}(-[a-z]+)+-\d")
@@ -114,6 +117,8 @@ class Task(BaseModel):
     enabled: bool = True
     goal: str
     done_when: str
+    ready_when: str = ""
+    ungated_labels: list[str] = []
     start_url: str
     inputs: dict[str, str]
     max_steps: int = 40
@@ -151,12 +156,20 @@ def load_task(task_id: str, path: Path = ROOT / "tasks.yaml") -> Task:
 
 PAGE_JS = r"""
 const NOTICES = '[role="alert"],[role="status"],[aria-live]:not([aria-live="off"]),[class*="awsui_flash"]';
+// Cloudscape's spinner root is awsui_root_1612d_*, and its ProgressBar is a native <progress>.
+const LOADING = '[aria-busy="true"],[role="progressbar"],progress:not([class*="awsui_complete"]),' +
+  '[class*="awsui_root_1612d"],[class*="awsui_status-loading"]';
+const OVERLAYS = '[role="dialog"],[role="alertdialog"],[aria-modal="true"]';
+// The split panel and toolbar drawer. Not the classic drawer: the side navigation is one too.
+const DRAWERS = '[class*="awsui_drawer_1r9lg"],[class*="awsui_drawer_12i0j"]';
 const ROLES = ['button','link','checkbox','radio','switch','tab','menuitem','menuitemradio',
   'menuitemcheckbox','option','treeitem','combobox','textbox','searchbox','spinbutton'];
 const SELECTOR = 'a[href],button,input,select,textarea,summary,[contenteditable="true"]' +
   ROLES.map(role => `,[role="${role}"]`).join('');
 const clean = text => (text || '').replace(/\s+/g, ' ').trim();
 const isToggle = el => el.tagName === 'INPUT' && ['checkbox', 'radio'].includes(el.type);
+const isDisclosure = el => el.hasAttribute('aria-expanded') ||
+  !['', null, 'false'].includes(el.getAttribute('aria-haspopup'));
 const roleOf = el => {
   if (el.tagName === 'INPUT' && ['password', 'file', 'hidden'].includes(el.type)) return null;
   const explicit = el.getAttribute('role');
@@ -170,12 +183,11 @@ const roleOf = el => {
   if (['button', 'submit', 'reset', 'image'].includes(el.type)) return 'button';
   return el.type === 'search' ? 'searchbox' : el.type === 'number' ? 'spinbutton' : 'textbox';
 };
+const labelledText = el => clean((el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+  .map(id => el.getRootNode().getElementById(id)).filter(Boolean).map(n => n.innerText || n.textContent).join(' '));
 const ownName = el => {
-  const labelled = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
-    .map(id => el.getRootNode().getElementById(id)).filter(Boolean);
   const isField = ['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName);
-  return clean(labelled.map(n => n.innerText || n.textContent).join(' ')) ||
-    clean(el.getAttribute('aria-label')) ||
+  return labelledText(el) || clean(el.getAttribute('aria-label')) ||
     clean([...(el.labels || [])].map(label => label.innerText).join(' ')) ||
     (el.tagName === 'INPUT' && ['button', 'submit', 'reset'].includes(el.type) ? clean(el.value) : '') ||
     (isField ? '' : clean(el.innerText || el.textContent)) || clean(el.getAttribute('alt')) ||
@@ -234,20 +246,28 @@ const isWrapper = el => {
 };
 """
 OBSERVE_JS = "() => {" + PAGE_JS + r"""
-  const found = [], notices = [];
+  const found = [], nodes = [], notices = [], overlays = [], drawers = [];
+  let loading = false;
+  const shown = el => {  // screen-reader announcers are clipped to 1px
+    const box = el.getBoundingClientRect();
+    return box.width > 1 && box.height > 1 && el.checkVisibility();
+  };
   const walk = root => {
     for (const el of root.querySelectorAll('*')) {
       el.removeAttribute('data-jev-idx');
-      if (el.matches(NOTICES) && !el.parentElement?.closest(NOTICES)) {
-        const box = el.getBoundingClientRect();  // screen-reader announcers are clipped to 1px
-        if (box.width > 1 && box.height > 1 && el.checkVisibility() && clean(el.innerText)) notices.push(clean(el.innerText));
-      }
+      if (el.closest('[data-jev-ignore]')) continue;
+      if (el.matches(NOTICES) && !el.parentElement?.closest(NOTICES) && shown(el) && clean(el.innerText))
+        notices.push(clean(el.innerText));
+      if (el.matches(LOADING) && shown(el)) loading = true;
+      if (el.matches(OVERLAYS) && shown(el)) overlays.push(el);
+      if (el.matches(DRAWERS) && !/closed|hidden/.test(el.className) && shown(el)) drawers.push(el);
       if (el.matches(SELECTOR) && roleOf(el) && usable(el) && !isWrapper(el)) {
         const box = el.getBoundingClientRect(), idx = found.length + 1;
         el.setAttribute('data-jev-idx', idx);
+        nodes.push(el);
         found.push({idx, role: roleOf(el), name: nameOf(el), tag: el.tagName.toLowerCase(),
           input_type: el.tagName === 'INPUT' ? el.type : '', value: stateOf(el),
-          editable: editableOf(el), borrowed_name: borrowsName(el),
+          editable: editableOf(el), borrowed_name: borrowsName(el), disclosure: isDisclosure(el),
           href: typeof el.href === 'string' ? el.href : '',
           bbox: {x: box.x, y: box.y, w: box.width, h: box.height}});
       }
@@ -256,11 +276,25 @@ OBSERVE_JS = "() => {" + PAGE_JS + r"""
     }
   };
   walk(document);
+  const panel = overlays.at(-1) || drawers.at(-1);  // a modal sits on top of any drawer
+  const inPanel = nodes.map(el => {
+    for (let n = el; n; n = n.parentElement || n.getRootNode().host) if (n === panel) return true;
+    return false;
+  });
+  const panelHeading = panel && (labelledText(panel) ||
+    clean(panel.querySelector('h1,h2,h3,h4,[role="heading"]')?.innerText) ||
+    clean(panel.getAttribute('aria-label')) || 'Untitled panel');
   const heading = [...document.querySelectorAll('h1')].find(h => h.checkVisibility());
-  return {url: location.href, title: document.title, elements: found, notices,
-    heading: clean(heading?.innerText), text: (document.body?.innerText || '').slice(0, 20000)};
+  // innerText has no way to skip a subtree, and this runs without a paint, so nothing flickers.
+  const ignored = [...document.querySelectorAll('[data-jev-ignore]')];
+  ignored.forEach(el => el.style.setProperty('display', 'none'));
+  const text = (document.body?.innerText || '').slice(0, 20000);
+  ignored.forEach(el => el.style.removeProperty('display'));
+  return {url: location.href, title: document.title, notices, loading, open_panel: panelHeading || '',
+    elements: [...found.filter((_, i) => inPanel[i]), ...found.filter((_, i) => !inPanel[i])],
+    heading: clean(heading?.innerText), text};
 }"""
-IDENTITY_JS = "el => {" + PAGE_JS + "return [roleOf(el), nameOf(el)]; }"
+IDENTITY_JS = "el => {" + PAGE_JS + "return [roleOf(el), nameOf(el), isDisclosure(el)]; }"
 
 
 @dataclass
@@ -275,6 +309,7 @@ class Element:
     href: str
     bbox: dict
     borrowed_name: bool = False
+    disclosure: bool = False
 
     @property
     def row(self) -> str:
@@ -291,6 +326,8 @@ class Snapshot:
     ms: float = 0.0
     heading: str = ""
     notices: list[str] = field(default_factory=list)
+    loading: bool = False
+    open_panel: str = ""
 
     @property
     def table(self) -> str:
@@ -302,7 +339,8 @@ def observe(page: Page) -> Snapshot:
     raw = page.evaluate(OBSERVE_JS)
     elements = [Element(**element) for element in raw["elements"]]
     ms = (time.perf_counter() - started) * 1000
-    return Snapshot(raw["url"], raw["title"], raw["text"], elements, ms, raw["heading"], raw["notices"])
+    return Snapshot(raw["url"], raw["title"], raw["text"], elements, ms, raw["heading"], raw["notices"], raw["loading"],
+                    raw["open_panel"])
 
 
 def page_notices(snapshot: Snapshot, baseline: Snapshot | None, inputs: dict[str, str]) -> str:
@@ -322,29 +360,44 @@ def page_notices(snapshot: Snapshot, baseline: Snapshot | None, inputs: dict[str
 
 
 def settle(page: Page) -> tuple[Snapshot | None, float, bool]:
-    """Observe until URL and table hold still for one poll. Returns (snapshot, ms, timed_out).
+    """Observe until URL and table hold still with nothing loading. Returns (snapshot, ms, timed_out).
 
     An almost empty table never counts as settled. The console redirects while it renders, and
     a redirect tears down the page mid-read, so that's only another unsettled poll. An off-limits
     URL ends the wait at once, possibly with no snapshot; the caller must check page.url.
     """
     started = time.perf_counter()
-    snapshot, previous = None, None
+    snapshot, previous, repeats = None, None, 0
     while not blocked_reason(page.url):
         out_of_time = time.perf_counter() - started >= SETTLE_CAP_S
         current = None
         try:
             snapshot = observe(page)
-            current = (snapshot.url, len(snapshot.elements), hash(snapshot.table))
+            current = (snapshot.url, len(snapshot.elements), hash(snapshot.table), snapshot.loading)
         except PlaywrightError:
             if out_of_time:
                 raise
-        settled = current is not None and current == previous and current[1] >= MIN_SETTLED_ELEMENTS
+        repeats = repeats + 1 if current is not None and current == previous else 1
+        settled = (current is not None and repeats >= SETTLE_OBSERVATIONS
+                   and current[1] >= MIN_SETTLED_ELEMENTS and not snapshot.loading)
         if settled or (out_of_time and current is not None):
             return snapshot, (time.perf_counter() - started) * 1000, not settled
         previous = current
         page.wait_for_timeout(SETTLE_POLL_MS)
     return snapshot, (time.perf_counter() - started) * 1000, False
+
+
+def wait_ready(page: Page, name: str) -> tuple[float, bool]:
+    """Wait for a named control, for pages that pause longer than settle can tell. Returns (ms, timed_out)."""
+    started = time.perf_counter()
+    while not blocked_reason(page.url) and time.perf_counter() - started < READY_CAP_S:
+        try:
+            if any(name.lower() in element.name.lower() for element in observe(page).elements):
+                return (time.perf_counter() - started) * 1000, False
+        except PlaywrightError:
+            pass
+        page.wait_for_timeout(SETTLE_POLL_MS)
+    return (time.perf_counter() - started) * 1000, not blocked_reason(page.url)
 
 
 # Jev: the only code that touches the SDK
@@ -484,12 +537,15 @@ def shortlist(jev: Jev, items: list[Element], brief: dict) -> list[Element]:
     for start in range(0, len(items), SCORE_BATCH):
         batch = {str(e.idx): f"How relevant is this element? {e.row}" for e in items[start:start + SCORE_BATCH]}
         scores.update(jev.score(batch, RELEVANCE, brief))
-    ranked = sorted(items, key=lambda e: (-scores.get(str(e.idx), 0.0), e.idx))
+    ranked = sorted(items, key=lambda e: -scores.get(str(e.idx), 0.0))  # stable: ties keep table order
     return sorted(ranked[:SHORTLIST], key=lambda e: e.idx)
 
 
 def brief_state(goal: str, snapshot: Snapshot) -> dict:
-    return {"goal": goal, "url": redact(clean(snapshot.url)), "title": short(snapshot.title)}
+    brief = {"goal": goal, "url": redact(clean(snapshot.url)), "title": short(snapshot.title)}
+    if snapshot.open_panel:
+        brief["open_panel"] = short(snapshot.open_panel)
+    return brief
 
 
 def full_state(brief: dict, history: list[dict], rows: list[Element], notices: str) -> dict:
@@ -520,7 +576,7 @@ def decide(jev: Jev, goal: str, snapshot: Snapshot, history: list[dict], inputs:
     brief = brief_state(goal, snapshot)
     heads = {op: shortlist(jev, items, brief) for op, items in candidates(snapshot.elements, inputs).items()}
     kept = {e.idx: e for items in heads.values() for e in items}
-    rows = snapshot.elements if len(snapshot.elements) <= MAX_CHOICE else [kept[i] for i in sorted(kept)]
+    rows = snapshot.elements if len(snapshot.elements) <= MAX_CHOICE else [e for e in snapshot.elements if e.idx in kept]
     state = full_state(brief, history, rows, notices)
     questions = {"op": (RULES, {op: text for op, text in OPS.items() if op in heads or op not in TARGETED})}
     for op, items in heads.items():
@@ -635,7 +691,16 @@ class ActionError(Exception):
 
 def needs_gate(decision: Decision) -> bool:
     target = decision.target
-    return decision.op == "CLICK" and (target.borrowed_name or requires_approval(target.name))
+    if decision.op != "CLICK" or target.disclosure or target.role == "radio":  # these open or select, never commit
+        return False
+    return target.borrowed_name or requires_approval(target.name)
+
+
+def is_exempt(decision: Decision, ungated_labels: tuple[str, ...]) -> bool:
+    """The task says this exact label commits nothing. A name borrowed from an ancestor isn't the label."""
+    target = decision.target
+    return (needs_gate(decision) and not target.borrowed_name and target.name in ungated_labels
+            and bool(COMMIT_RE.search(target.name)))
 
 
 def missing_required(elements: list[Element]) -> list[str]:
@@ -668,6 +733,11 @@ def gate(decision: Decision, url: str, dry_run: bool, ask: Callable[[str], str],
     return "approved" if prompt(ask, "Type y to click: ") == "y" else "denied"
 
 
+def find_element(page: Page, element: Element) -> list[Locator]:
+    selector = f'[data-jev-idx="{element.idx}"]'
+    return [frame.locator(selector) for frame in page.frames if frame.locator(selector).count() == 1]
+
+
 def act(page: Page, decision: Decision) -> None:
     if decision.op in ("SCROLL_DOWN", "SCROLL_UP"):
         page.mouse.wheel(0, SCROLL_PX if decision.op == "SCROLL_DOWN" else -SCROLL_PX)
@@ -675,12 +745,11 @@ def act(page: Page, decision: Decision) -> None:
         page.wait_for_timeout(WAIT_MS)
     else:
         element = decision.target
-        selector = f'[data-jev-idx="{element.idx}"]'
-        found = [frame.locator(selector) for frame in page.frames if frame.locator(selector).count() == 1]
+        found = find_element(page, element)
         if not found:
             raise ActionError(f"element {element.idx} is gone")
         # The gate approved this element, so a re-render since then must not click something else.
-        if found[0].evaluate(IDENTITY_JS) != [element.role, element.name]:
+        if found[0].evaluate(IDENTITY_JS) != [element.role, element.name, element.disclosure]:
             raise ActionError(f"element {element.idx} changed")
         if decision.op == "CLICK":
             found[0].click(timeout=ACT_TIMEOUT_MS)
@@ -688,6 +757,114 @@ def act(page: Page, decision: Decision) -> None:
             found[0].fill(decision.turn.inputs[decision.input_key], timeout=ACT_TIMEOUT_MS)
         else:
             found[0].select_option(label=decision.turn.inputs[decision.input_key], timeout=ACT_TIMEOUT_MS)
+
+
+# Demo overlays, for recordings. Only --demo reaches this, and none of it may cost the run.
+
+DEMO_TARGET_MS = 600
+DEMO_HUD = "jev-demo-hud"
+DEMO_BANNER = "jev-demo-banner"
+DEMO_OUTLINE = "jev-demo-outline"
+DEMO_LABEL = "jev-demo-label"
+DEMO_LABEL_CSS = "padding:2px 8px;border-radius:4px;background:#232f3e;color:#fff;"
+DEMO_HUD_CSS = DEMO_LABEL_CSS + "left:12px;bottom:40px;"
+DEMO_BANNER_CSS = ("top:12px;left:50%;transform:translateX(-50%);padding:8px 16px;border-radius:4px;"
+                   "background:#d91515;color:#fff;font-weight:600;")
+DEMO_SHOW_JS = r"""([id, css, text]) => {
+  let el = document.getElementById(id);
+  if (!el) {
+    el = document.createElement('div');
+    el.id = id;
+    el.setAttribute('data-jev-ignore', '');
+    document.body.append(el);
+  }
+  el.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;white-space:pre;' +
+    'font:13px/1.4 system-ui,sans-serif;' + css;
+  el.textContent = text;
+}"""
+DEMO_HIDE_JS = "id => document.getElementById(id)?.remove()"
+# Installed before the page loads, so it reaches every frame and survives navigation. Text patterns
+# do most of the work: they don't depend on the console's markup, which the menu selectors do.
+DEMO_PRIVACY_JS = r"""(() => {
+  const SECRET = /arn:aws[\w-]*:|\b\d{4}-\d{4}-\d{4}\b|\b\d{12}\b/;
+  const MENU = '#nav-usernameMenu,[data-testid="awsc-nav-account-menu-button"],' +
+    '[data-testid="awsc-copy-accountid"],#menu--account';
+  const BLUR = 'blur(8px)';
+  const blur = el => el?.style?.setProperty('filter', BLUR, 'important');
+  const style = document.createElement('style');
+  style.setAttribute('data-jev-ignore', '');
+  style.textContent = `${MENU} { filter: ${BLUR} !important; }`;
+  (document.head || document.documentElement).append(style);
+
+  const watched = new WeakSet();
+  let scheduled = false;
+  const schedule = () => {
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => { scheduled = false; scan(document); });  // runs before the next paint
+  };
+  const watch = root => {
+    if (watched.has(root)) return;
+    watched.add(root);
+    new MutationObserver(schedule).observe(root, {childList: true, subtree: true, characterData: true});
+  };
+  const scan = root => {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      if (n.nodeType === Node.TEXT_NODE) {
+        if (SECRET.test(n.data)) blur(n.parentElement);
+        continue;
+      }
+      if (n.matches(MENU) || SECRET.test(n.value)) blur(n);
+      if (n.shadowRoot) { watch(n.shadowRoot); scan(n.shadowRoot); }
+    }
+  };
+  watch(document);
+  document.addEventListener('input', schedule, true);
+  schedule();
+})();"""
+
+
+def show_overlay(page: Page, overlay_id: str, css: str, text: str = "") -> None:
+    try:
+        page.evaluate(DEMO_SHOW_JS, [overlay_id, css, text])
+    except PlaywrightError:
+        pass
+
+
+def hide_overlay(page: Page, overlay_id: str) -> None:
+    try:
+        page.evaluate(DEMO_HIDE_JS, overlay_id)
+    except PlaywrightError:
+        pass
+
+
+def demo_hud(page: Page, step: int, decision: Decision, jev_ms: float) -> None:
+    show_overlay(page, DEMO_HUD, DEMO_HUD_CSS, f"Step {step} · Jev {decision.confidence:.2f} · {jev_ms:.0f} ms")
+
+
+def demo_target(page: Page, decision: Decision) -> None:
+    """Outlines the target with a separate box, so the element itself is never touched."""
+    element = decision.target
+    try:
+        found = find_element(page, element)
+        if not found:
+            return
+        found[0].scroll_into_view_if_needed(timeout=ACT_TIMEOUT_MS)
+        box = found[0].bounding_box()
+        if not box:
+            return
+        x, y, w, h = box["x"], box["y"], box["width"], box["height"]
+        show_overlay(page, DEMO_OUTLINE, f"left:{x}px;top:{y}px;width:{w}px;height:{h}px;box-sizing:border-box;"
+                                         "border:4px solid #ff9900;border-radius:4px;")
+        show_overlay(page, DEMO_LABEL, DEMO_LABEL_CSS + "max-width:320px;overflow:hidden;text-overflow:ellipsis;"
+                                       f"left:min({x}px,calc(100vw - 340px));top:min({y + h + 6}px,calc(100vh - 32px));",
+                     f"{decision.op}  {short(element.name) or '(no name)'}  {decision.confidence:.2f}")
+        page.wait_for_timeout(DEMO_TARGET_MS)
+    except PlaywrightError:
+        pass
+    hide_overlay(page, DEMO_OUTLINE)
+    hide_overlay(page, DEMO_LABEL)
 
 
 # Logging
@@ -744,19 +921,23 @@ class Limits:
     max_steps: int
     threshold: float
     dry_run: bool = False
+    ungated_labels: tuple[str, ...] = ()
+    demo: bool = False
 
 
 def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLog, limits: Limits,
-             ask: Callable[[str], str] = input, done_when: str = "") -> Outcome:
+             ask: Callable[[str], str] = input, done_when: str = "", ready_when: str = "") -> Outcome:
     history: list[dict] = []
     failures, paused, snapshot, baseline = 0, 0.0, None, None
-    check_done = False
+    check_done, wait_checks = "", 0  # the trigger for the next step's completion check, if any
     started = time.monotonic()
     for step in range(1, limits.max_steps + 1):
         if time.monotonic() - started - paused > MAX_WALL_S:
             return Outcome("time_limit", snapshot)
         try:
+            ready_ms, not_ready = wait_ready(page, ready_when) if ready_when and step == 1 else (0.0, False)
             snapshot, settle_ms, settle_timeout = settle(page)
+            settle_ms, settle_timeout = settle_ms + ready_ms, settle_timeout or not_ready
         except PlaywrightError as error:
             failures += 1
             if failures >= MAX_FAILURES:
@@ -770,10 +951,10 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
         notices = page_notices(snapshot, baseline, inputs)
         noul_done, decision = None, None
         if check_done and done_when:
-            noul_done = ask_done(jev, done_when, goal, snapshot, history, notices, "after_gate")
+            noul_done = ask_done(jev, done_when, goal, snapshot, history, notices, check_done)
             if noul_done["value"] >= NOUL_DONE_THRESHOLD:
                 decision = noul_decision(noul_done["value"])
-        check_done = False
+        check_done = ""
         if decision is None:
             decision = decide(jev, goal, snapshot, history, inputs, notices)
             if decision.op == "DONE" and decision.confidence < limits.threshold and done_when:
@@ -787,6 +968,8 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
             decision = ask_human(decision, doubtful, ask)
             if decision is None:
                 return Outcome("aborted", snapshot)
+        if limits.demo:
+            demo_hud(page, step, decision, jev_ms)
 
         stop, reason = {"DONE": ("done", ""), "BLOCKED": ("blocked", "Jev chose BLOCKED")}.get(decision.op, ("", ""))
         if decision.input_key == NO_INPUT:
@@ -795,14 +978,23 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
         if decision.op == "CLICK" and element.href.startswith("http") and (bad := blocked_reason(element.href)):
             stop, reason = "blocked", f"link target: {bad}"
         gate_screenshot, readiness = None, None
-        if not stop and needs_gate(decision):
+        exempt = not stop and is_exempt(decision, limits.ungated_labels)
+        if not stop and not exempt and needs_gate(decision):
             gate_screenshot = capture(page, log.dir / f"step_{step:02d}_gate.png", full_page=True)
             tick = time.perf_counter()
             readiness = ask_readiness(jev, goal, snapshot, history, notices)
             jev_ms += (time.perf_counter() - tick) * 1000
-        gate_result = "not_required" if stop else gate(decision, snapshot.url, limits.dry_run, ask, readiness)
-        paused += time.monotonic() - pause_started
+        waiting = limits.demo and readiness is not None and not limits.dry_run
+        if waiting:
+            show_overlay(page, DEMO_BANNER, DEMO_BANNER_CSS, "Waiting for human approval")
+        gate_result = ("not_required" if stop else "exempt" if exempt
+                       else gate(decision, snapshot.url, limits.dry_run, ask, readiness))
+        if waiting:
+            hide_overlay(page, DEMO_BANNER)
         stop = stop or {"denied": "denied", "dry_run_stop": "dry_run_stop"}.get(gate_result, "")
+        if limits.demo and not stop and decision.target:
+            demo_target(page, decision)
+        paused += time.monotonic() - pause_started
 
         result, act_ms = "stopped" if stop else "ok", 0.0
         if not stop:
@@ -814,7 +1006,10 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
                 failures += 1
                 result = f"failed: {short(str(error))}"
             act_ms = (time.perf_counter() - tick) * 1000
-            check_done = gate_result == "approved" and result == "ok"
+            if gate_result == "approved" and result == "ok":
+                check_done, wait_checks = "after_gate", MAX_WAIT_CHECKS
+            elif decision.op == "WAIT" and wait_checks:  # the result may land seconds after the click
+                check_done, wait_checks = "after_wait", wait_checks - 1
 
         row = element.row if element else ""
         history.append({"op": decision.op, "element": row, "result": result})
@@ -824,7 +1019,7 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
         human_target = clean(row) if target and target.source == "human" else None
         log.step({"step": step, "url": redact(clean(snapshot.url)), "element_count": len(snapshot.elements),
                   "op": head_log(decision.heads["op"]), "target": head_log(target), "target_row": clean(row),
-                  "human_target": human_target, "page_notices": notices, "noul_done": noul_done,
+                  "human_target": human_target, "page_notices": notices, "open_panel": snapshot.open_panel, "noul_done": noul_done,
                   "readiness": readiness, "input": decision.input_key, "confidence": decision.confidence, "source": decision.source,
                   "gate": gate_result, "result": result, "settle_ms": settle_ms, "settle_timeout": settle_timeout,
                   "latency_ms": {"observe": snapshot.ms, "jev": jev_ms, "act": act_ms},
@@ -865,9 +1060,11 @@ def drive(task: Task, goal: str, inputs: dict[str, str], done_when: str, log: Ru
     pw = sync_playwright().start()
     try:  # pw.stop() only disconnects; the human's browser stays open
         page = pw.chromium.connect_over_cdp(cdp_url).contexts[0].new_page()
+        if limits.demo:
+            page.add_init_script(DEMO_PRIVACY_JS)
         page.goto(task.start_url)
         jev = Jev(os.environ.get("JEV_MODEL", "jev-latest"))
-        return run_loop(page, jev, goal, inputs, log, limits, ask, done_when)
+        return run_loop(page, jev, goal, inputs, log, limits, ask, done_when, task.ready_when)
     finally:
         pw.stop()
 
@@ -880,7 +1077,7 @@ def teardown_lines(report: list[str]) -> list[str]:
     return lines or ["Teardown: nothing to delete"]
 
 
-def run_task(task_id: str, dry_run: bool = False, ask: Callable[[str], str] = input) -> int:
+def run_task(task_id: str, dry_run: bool = False, ask: Callable[[str], str] = input, demo: bool = False) -> int:
     task = load_task(task_id)
     if not task.enabled:
         raise SystemExit(f"{task_id} is disabled in tasks.yaml")
@@ -894,7 +1091,7 @@ def run_task(task_id: str, dry_run: bool = False, ask: Callable[[str], str] = in
     log = RunLog(run_id)
     check = verify.CHECKS[task.verifier]
     threshold = float(os.environ.get("JEV_CONFIDENCE_THRESHOLD", "0.7"))
-    limits = Limits(task.max_steps, threshold, dry_run)
+    limits = Limits(task.max_steps, threshold, dry_run, tuple(task.ungated_labels), demo)
     started_at, started = datetime.now(timezone.utc), time.monotonic()
     outcome, passed, teardown_result = Outcome("error"), None, []
     print(f"Run {run_id}: {task.id}{' (dry run)' if dry_run else ''}")
@@ -932,11 +1129,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("task_id")
     parser.add_argument("--dry-run", action="store_true", help="stop at the approval gate")
+    parser.add_argument("--demo", action="store_true", help="show overlays and blur account details, for recordings")
     args = parser.parse_args()
     load_dotenv(ROOT / ".env")
     if not os.environ.get("TYPESAFE_API_KEY", "").strip():
         raise SystemExit("TYPESAFE_API_KEY is empty. Paste your OpenRouter API key into .env.")
-    return run_task(args.task_id, args.dry_run)
+    return run_task(args.task_id, args.dry_run, demo=args.demo)
 
 
 if __name__ == "__main__":

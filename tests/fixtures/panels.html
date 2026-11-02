@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head><title>Panels</title></head>
+<body>
+  <main>
+    <button>Page button</button>
+    <button>Other page button</button>
+  </main>
+  <div id="slot"></div>
+  <script>
+    const split = 'class="awsui_drawer_1r9lg_gfpdm_13"';
+    const inPanel = "<button>In panel</button>";
+    document.getElementById("slot").innerHTML = {
+      none: "",
+      dialog: `<div role="dialog" aria-labelledby="title"><h3 id="title">Close side panel</h3>${inPanel}</div>`,
+      alert: `<div role="alertdialog"><h2>Are you sure?</h2>${inPanel}</div>`,
+      modal: `<div aria-modal="true"><h3>Confirm</h3>${inPanel}</div>`,
+      split: `<div ${split}><h2>Configure custom execution role</h2>${inPanel}</div>`,
+      toolbar: `<div class="awsui_drawer_12i0j_181ed_13"><h2>Details</h2>${inPanel}</div>`,
+      labelled: `<div role="dialog" aria-label="Panel label">${inPanel}</div>`,
+      untitled: `<div role="dialog">${inPanel}</div>`,
+      hidden: `<div role="dialog" style="display: none"><h2>Hidden</h2>${inPanel}</div>`,
+      closed: `<div class="awsui_drawer_1r9lg_gfpdm_13 awsui_drawer-closed_1r9lg_gfpdm_50"><h2>Closed</h2>${inPanel}</div>`,
+      nav: `<div class="awsui_drawer_1uo6m_89u0x_19"><h2>Lambda</h2>${inPanel}</div>`,
+      stacked: `<div ${split}><h2>Configure custom execution role</h2>${inPanel}</div>
+                <div role="dialog"><h3>Close side panel</h3><button>In dialog</button></div>`,
+    }[new URLSearchParams(location.search).get("kind")];
+  </script>
+</body>
+</html>

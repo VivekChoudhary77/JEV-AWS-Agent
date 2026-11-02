@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head><title>Loading</title></head>
+<body>
+  <button>One</button>
+  <button>Two</button>
+  <button>Three</button>
+  <button>Four</button>
+  <button>Five</button>
+  <button>Six</button>
+  <div id="slot"></div>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const size = 'style="display: inline-block; width: 20px; height: 20px"';
+    document.getElementById("slot").innerHTML = {
+      busy: `<div aria-busy="true" ${size}></div>`,
+      idle: `<div aria-busy="false" ${size}></div>`,
+      hidden: `<div aria-busy="true" style="display: none"></div>`,
+      progressbar: `<div role="progressbar" ${size}></div>`,
+      progress: `<progress max="100" value="40"></progress>`,
+      finished: `<progress class="awsui_complete_11huc_12zdc_1" max="100" value="100"></progress>`,
+      spinner: `<span class="awsui_root_1612d_vxp9i_43" ${size}></span>`,
+      status: `<span class="awsui_status-loading_1cbgc_19apy_93" ${size}></span>`,
+      in_progress: `<span class="awsui_status-in-progress_1cbgc_19apy_90" ${size}></span>`,
+    }[params.get("kind")];
+    const clearAfter = Number(params.get("clear"));
+    if (clearAfter) setTimeout(() => document.getElementById("slot").replaceChildren(), clearAfter);
+  </script>
+</body>
+</html>

@@ -13,13 +13,16 @@ HOST = "https://us-east-1.console.aws.amazon.com"
 @pytest.mark.parametrize("name", [
     "Create budget", "Launch instance", "Submit", "Delete", "Terminate instance", "Confirm",
     "Purchase", "Subscribe", "Upgrade plan", "Run", "Save changes", "CREATE FUNCTION",
-    "CreateBucket",
+    "Create Event Function", "Re-run",
 ])
 def test_commit_words_require_approval(name):
     assert agent.requires_approval(name)
 
 
-@pytest.mark.parametrize("name", ["Cancel", "Next", "Previous", "Budgets", "Use an existing role"])
+@pytest.mark.parametrize("name", [
+    "Cancel", "Next", "Previous", "Budgets", "Use an existing role", "Runtime Node.js 24.x", "Running instances",
+    "Saved views", "Recreate",
+])
 def test_non_commit_words_pass(name):
     assert not agent.requires_approval(name)
 
@@ -136,6 +139,8 @@ def test_done_when_resolves_in_the_real_tasks():
     assert budget == f"A banner says the budget jevagent-{run_id}-budget was created successfully."
     database = agent.load_task("99_rds_create_db").render(run_id)[2]
     assert database == f"A banner says the database jevagent-{run_id}-db is being created."
+    ec2 = agent.load_task("04_ec2_launch_t3micro").render(run_id)[2]
+    assert ec2 == 'A banner says "Successfully initiated launch of instance".'
 
 
 def test_schema_rejects_goal_placeholder_without_input():
@@ -155,6 +160,22 @@ def test_schema_exempts_existing_resources_from_prefix():
 def test_schema_rejects_blocked_start_url():
     with pytest.raises(ValidationError, match="start_url"):
         task(start_url=f"{HOST}/iam/home")
+
+
+def test_ready_when_is_optional_and_only_task_03_sets_it():
+    assert task().ready_when == ""
+    ids = ["00_read_budget", "01_create_budget", "03_lambda_function_url",
+           "04_ec2_launch_t3micro", "05_bedrock_playground_prompt", "99_rds_create_db"]
+    assert {i: agent.load_task(i).ready_when for i in ids if agent.load_task(i).ready_when} == {
+        "03_lambda_function_url": "Function name"}
+
+
+def test_only_task_03_has_ungated_labels():
+    assert task().ungated_labels == []
+    ids = ["00_read_budget", "01_create_budget", "03_lambda_function_url",
+           "04_ec2_launch_t3micro", "05_bedrock_playground_prompt", "99_rds_create_db"]
+    assert {i: agent.load_task(i).ungated_labels for i in ids if agent.load_task(i).ungated_labels} == {
+        "03_lambda_function_url": ["Save"]}
 
 
 def test_every_task_in_the_file_loads():
