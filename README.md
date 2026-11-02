@@ -50,7 +50,7 @@ Wall time includes human approval, verification and teardown. Jev took a median 
 
 ## Setup
 
-You need Linux with Google Chrome, [uv](https://docs.astral.sh/uv/), an [OpenRouter](https://openrouter.ai) API key and an AWS account.
+You need a browser, [uv](https://docs.astral.sh/uv/) package installer, an [OpenRouter](https://openrouter.ai) API key and an AWS account.
 
 ```bash
 uv sync
