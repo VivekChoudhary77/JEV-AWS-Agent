@@ -794,14 +794,17 @@ DEMO_PRIVACY_JS = r"""(() => {
   const style = document.createElement('style');
   style.setAttribute('data-jev-ignore', '');
   style.textContent = `${MENU} { filter: ${BLUR} !important; }`;
-  (document.head || document.documentElement).append(style);
 
   const watched = new WeakSet();
   let scheduled = false;
   const schedule = () => {
     if (scheduled) return;
     scheduled = true;
-    requestAnimationFrame(() => { scheduled = false; scan(document); });  // runs before the next paint
+    requestAnimationFrame(() => {  // runs before the next paint
+      scheduled = false;
+      if (!style.isConnected) (document.head || document.documentElement)?.append(style);  // null at install
+      scan(document);
+    });
   };
   const watch = root => {
     if (watched.has(root)) return;

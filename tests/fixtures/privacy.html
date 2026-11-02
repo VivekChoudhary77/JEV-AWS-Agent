@@ -2,7 +2,7 @@
 <html>
 <head><title>Privacy</title></head>
 <body>
-  <div id="menu"><span id="nav-usernameMenu">jev-agent</span></div>
+  <span id="nav-usernameMenu">jev-agent</span>
   <button id="testid" data-testid="awsc-nav-account-menu-button">Account</button>
   <span id="account">Account ID: 1111-2222-3333</span>
   <span id="account-plain">111122223333</span>
@@ -15,11 +15,6 @@
   <div id="host"></div>
   <script>
     document.getElementById("host").attachShadow({mode: "open"}).innerHTML = "<span>arn:aws:s3:::bucket</span>";
-    document.getElementById("menu").id = "wrapper";
-    document.getElementById("nav-usernameMenu").id = "nav-usernameMenu";
-    document.getElementById("wrapper").id = "menu-wrapper";
-    document.querySelector("#nav-usernameMenu").parentElement.insertAdjacentHTML("beforeend", '<span id="menu">x</span>');
-    document.getElementById("menu").id = "menu";
   </script>
 </body>
 </html>

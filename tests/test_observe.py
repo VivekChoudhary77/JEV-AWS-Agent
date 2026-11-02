@@ -341,7 +341,7 @@ def test_demo_target_outlines_then_cleans_up_before_the_action(page, base_url):
     target = decision(agent.observe(page), "CLICK", "Next")
     target.heads = {"op": agent.Answer("CLICK", {"CLICK": 0.98}, 0.98)}
     shown = []
-    page.expose_function("noteLabel", shown.append)
+    page.expose_function("noteLabel", lambda text: shown.append(text))
     page.evaluate("""() => new MutationObserver(() => {
         const label = document.getElementById('jev-demo-label');
         if (label?.textContent) noteLabel(label.textContent);
@@ -356,7 +356,7 @@ def test_demo_target_outlines_then_cleans_up_before_the_action(page, base_url):
 def test_an_overlay_on_top_of_the_target_doesnt_block_the_click(page, base_url):
     page.goto(f"{base_url}/controls.html")
     target = decision(agent.observe(page), "CLICK", "Next")
-    page.evaluate("document.getElementById('next').onclick = e => { e.target.dataset.clicked = 'yes'; }")
+    page.evaluate("() => { document.getElementById('next').onclick = e => { e.target.dataset.clicked = 'yes'; }; }")
     box = page.locator("#next").bounding_box()
     agent.show_overlay(page, agent.DEMO_OUTLINE, f"left:{box['x']}px;top:{box['y']}px;width:{box['width']}px;"
                                                  f"height:{box['height']}px;background:#000;")
@@ -379,7 +379,7 @@ def blurred(page, selector):
 def private_page(page, base_url):
     page.add_init_script(agent.DEMO_PRIVACY_JS)
     page.goto(f"{base_url}/privacy.html")
-    page.wait_for_function("() => new Promise(requestAnimationFrame).then(() => true)")
+    page.wait_for_function("getComputedStyle(document.getElementById('arn')).filter !== 'none'", timeout=5000)
     return page
 
 

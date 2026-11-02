@@ -47,7 +47,7 @@
     runtime: "Python 3.14"
     existing_role_name: "jev-shared-lambda-exec"
   max_steps: 40
-  verifier: lambda_function_url
+  verifier: lambda_function_url 
 
 - id: 04_ec2_launch_t3micro
   enabled: true
