@@ -110,8 +110,9 @@ def task(**overrides):
 
 
 def test_schema_accepts_and_renders_a_valid_task():
-    goal, inputs, done_when = task().render("26103015140a3f")
+    goal, inputs, done_when, ready_when_commit = task().render("26103015140a3f")
     assert goal == "Make jevagent-26103015140a3f-x"
+    assert ready_when_commit == ""
     assert done_when == "jevagent-26103015140a3f-x is shown."
     assert inputs == {"thing_name": "jevagent-26103015140a3f-x"}
 
@@ -141,6 +142,23 @@ def test_done_when_resolves_in_the_real_tasks():
     assert database == f"A banner says the database jevagent-{run_id}-db is being created."
     ec2 = agent.load_task("04_ec2_launch_t3micro").render(run_id)[2]
     assert ec2 == 'A banner says "Successfully initiated launch of instance".'
+
+
+def test_ready_when_commit_resolves_in_the_real_tasks():
+    rendered = {i: agent.load_task(i).render("26103015140a3f")[3] for i in (
+        "00_read_budget", "01_create_budget", "03_lambda_function_url", "04_ec2_launch_t3micro",
+        "05_bedrock_playground_prompt", "99_rds_create_db")}
+    assert {i: claim for i, claim in rendered.items() if claim} == {
+        "03_lambda_function_url": "Runtime is Python 3.14, execution role is jev-shared-lambda-exec, "
+                                  "and Function URL auth type is AWS_IAM.",
+        "04_ec2_launch_t3micro": 'Name, key pair "Proceed without a key pair", and the default security group are set.',
+        "05_bedrock_playground_prompt": 'The model "Nova Micro" is selected and the prompt box contains '
+                                        '"Reply with one word: hello".'}
+
+
+def test_schema_rejects_ready_when_commit_placeholder_without_input():
+    with pytest.raises(ValidationError, match="missing inputs"):
+        task(ready_when_commit="{other} is set.")
 
 
 def test_schema_rejects_goal_placeholder_without_input():

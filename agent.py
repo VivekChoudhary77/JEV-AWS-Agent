@@ -41,6 +41,7 @@ READINESS_THRESHOLD = 0.8
 SETTLE_POLL_MS = 300
 SETTLE_CAP_S = 10
 SETTLE_OBSERVATIONS = 3
+STUCK_INDICATOR_S = 3
 READY_CAP_S = 15
 MIN_SETTLED_ELEMENTS = 5
 WAIT_MS = 1000
@@ -118,6 +119,7 @@ class Task(BaseModel):
     goal: str
     done_when: str
     ready_when: str = ""
+    ready_when_commit: str = ""
     ungated_labels: list[str] = []
     start_url: str
     inputs: dict[str, str]
@@ -126,7 +128,8 @@ class Task(BaseModel):
 
     @model_validator(mode="after")
     def check(self) -> Task:
-        fields = {field for text in (self.goal, self.done_when) for _, field, _, _ in Formatter().parse(text) if field}
+        fields = {field for text in (self.goal, self.done_when, self.ready_when_commit)
+                  for _, field, _, _ in Formatter().parse(text) if field}
         if fields - set(self.inputs) - {"run_id"}:
             raise ValueError(f"goal uses missing inputs: {sorted(fields - set(self.inputs))}")
         for key, value in self.inputs.items():
@@ -139,10 +142,11 @@ class Task(BaseModel):
             raise ValueError(f"unknown verifier: {self.verifier}")
         return self
 
-    def render(self, run_id: str) -> tuple[str, dict[str, str], str]:
+    def render(self, run_id: str) -> tuple[str, dict[str, str], str, str]:
         inputs = {key: value.format(run_id=run_id) for key, value in self.inputs.items()}
-        goal, done_when = (text.format(run_id=run_id, **inputs) for text in (self.goal, self.done_when))
-        return goal, inputs, done_when
+        goal, done_when, ready_when_commit = (text.format(run_id=run_id, **inputs)
+                                              for text in (self.goal, self.done_when, self.ready_when_commit))
+        return goal, inputs, done_when, ready_when_commit
 
 
 def load_task(task_id: str, path: Path = ROOT / "tasks.yaml") -> Task:
@@ -159,6 +163,9 @@ const NOTICES = '[role="alert"],[role="status"],[aria-live]:not([aria-live="off"
 // Cloudscape's spinner root is awsui_root_1612d_*, and its ProgressBar is a native <progress>.
 const LOADING = '[aria-busy="true"],[role="progressbar"],progress:not([class*="awsui_complete"]),' +
   '[class*="awsui_root_1612d"],[class*="awsui_status-loading"]';
+// Page furniture: a spinner here says nothing about the content the agent is waiting for.
+const CHROME = 'nav,[role="navigation"],[role="banner"],[role="contentinfo"],' +
+  'header:not(main header),footer:not(main footer),[id^="awsc-"]';
 const OVERLAYS = '[role="dialog"],[role="alertdialog"],[aria-modal="true"]';
 // The split panel and toolbar drawer. Not the classic drawer: the side navigation is one too.
 const DRAWERS = '[class*="awsui_drawer_1r9lg"],[class*="awsui_drawer_12i0j"]';
@@ -246,19 +253,22 @@ const isWrapper = el => {
 };
 """
 OBSERVE_JS = "() => {" + PAGE_JS + r"""
-  const found = [], nodes = [], notices = [], overlays = [], drawers = [];
-  let loading = false;
+  const found = [], nodes = [], notices = [], overlays = [], drawers = [], indicators = [];
   const shown = el => {  // screen-reader announcers are clipped to 1px
     const box = el.getBoundingClientRect();
     return box.width > 1 && box.height > 1 && el.checkVisibility();
   };
+  // The value is part of the text so that a progress bar that's moving never looks stuck.
+  const indicatorOf = el => ({
+    selector: el.tagName.toLowerCase() + (el.id ? `#${el.id}` : '') + (el.classList[0] ? `.${el.classList[0]}` : ''),
+    text: [clean(el.innerText), el.getAttribute('aria-valuenow') ?? el.value].filter(part => part ?? false).join(' ')});
   const walk = root => {
     for (const el of root.querySelectorAll('*')) {
       el.removeAttribute('data-jev-idx');
       if (el.closest('[data-jev-ignore]')) continue;
       if (el.matches(NOTICES) && !el.parentElement?.closest(NOTICES) && shown(el) && clean(el.innerText))
         notices.push(clean(el.innerText));
-      if (el.matches(LOADING) && shown(el)) loading = true;
+      if (el.matches(LOADING) && shown(el) && !el.closest(CHROME)) indicators.push(indicatorOf(el));
       if (el.matches(OVERLAYS) && shown(el)) overlays.push(el);
       if (el.matches(DRAWERS) && !/closed|hidden/.test(el.className) && shown(el)) drawers.push(el);
       if (el.matches(SELECTOR) && roleOf(el) && usable(el) && !isWrapper(el)) {
@@ -290,7 +300,7 @@ OBSERVE_JS = "() => {" + PAGE_JS + r"""
   ignored.forEach(el => el.style.setProperty('display', 'none'));
   const text = (document.body?.innerText || '').slice(0, 20000);
   ignored.forEach(el => el.style.removeProperty('display'));
-  return {url: location.href, title: document.title, notices, loading, open_panel: panelHeading || '',
+  return {url: location.href, title: document.title, notices, indicators, open_panel: panelHeading || '',
     elements: [...found.filter((_, i) => inPanel[i]), ...found.filter((_, i) => !inPanel[i])],
     heading: clean(heading?.innerText), text};
 }"""
@@ -326,12 +336,17 @@ class Snapshot:
     ms: float = 0.0
     heading: str = ""
     notices: list[str] = field(default_factory=list)
-    loading: bool = False
+    indicators: list[dict] = field(default_factory=list)
     open_panel: str = ""
+    stuck_indicators: list[dict] = field(default_factory=list)
 
     @property
     def table(self) -> str:
         return "\n".join(element.row for element in self.elements)
+
+    @property
+    def loading(self) -> bool:
+        return bool(self.indicators)
 
 
 def observe(page: Page) -> Snapshot:
@@ -339,7 +354,8 @@ def observe(page: Page) -> Snapshot:
     raw = page.evaluate(OBSERVE_JS)
     elements = [Element(**element) for element in raw["elements"]]
     ms = (time.perf_counter() - started) * 1000
-    return Snapshot(raw["url"], raw["title"], raw["text"], elements, ms, raw["heading"], raw["notices"], raw["loading"],
+    indicators = [{key: short(value) for key, value in indicator.items()} for indicator in raw["indicators"]]
+    return Snapshot(raw["url"], raw["title"], raw["text"], elements, ms, raw["heading"], raw["notices"], indicators,
                     raw["open_panel"])
 
 
@@ -359,27 +375,37 @@ def page_notices(snapshot: Snapshot, baseline: Snapshot | None, inputs: dict[str
     return redact(clean(" | ".join(parts)))[:MAX_NOTICE_CHARS]
 
 
+def indicator_key(indicator: dict) -> tuple[str, str]:
+    return indicator["selector"], indicator["text"]
+
+
 def settle(page: Page) -> tuple[Snapshot | None, float, bool]:
     """Observe until URL and table hold still with nothing loading. Returns (snapshot, ms, timed_out).
 
+    An indicator unchanged for STUCK_INDICATOR_S stops counting, and goes on snapshot.stuck_indicators.
     An almost empty table never counts as settled. The console redirects while it renders, and
     a redirect tears down the page mid-read, so that's only another unsettled poll. An off-limits
     URL ends the wait at once, possibly with no snapshot; the caller must check page.url.
     """
     started = time.perf_counter()
-    snapshot, previous, repeats = None, None, 0
+    snapshot, previous, repeats, first_seen = None, None, 0, {}
     while not blocked_reason(page.url):
         out_of_time = time.perf_counter() - started >= SETTLE_CAP_S
         current = None
         try:
             snapshot = observe(page)
-            current = (snapshot.url, len(snapshot.elements), hash(snapshot.table), snapshot.loading)
+            now = time.perf_counter()
+            first_seen = {key: first_seen.get(key, now) for key in map(indicator_key, snapshot.indicators)}
+            snapshot.stuck_indicators = [i for i in snapshot.indicators
+                                         if now - first_seen[indicator_key(i)] > STUCK_INDICATOR_S]
+            busy = len(snapshot.stuck_indicators) < len(snapshot.indicators)
+            current = (snapshot.url, len(snapshot.elements), hash(snapshot.table), busy)
         except PlaywrightError:
             if out_of_time:
                 raise
         repeats = repeats + 1 if current is not None and current == previous else 1
         settled = (current is not None and repeats >= SETTLE_OBSERVATIONS
-                   and current[1] >= MIN_SETTLED_ELEMENTS and not snapshot.loading)
+                   and current[1] >= MIN_SETTLED_ELEMENTS and not current[3])
         if settled or (out_of_time and current is not None):
             return snapshot, (time.perf_counter() - started) * 1000, not settled
         previous = current
@@ -555,6 +581,10 @@ def full_state(brief: dict, history: list[dict], rows: list[Element], notices: s
     return state
 
 
+def truth_question(claim: str) -> str:
+    return f"Is this true: {claim.rstrip('.')}?"
+
+
 def noul_state(goal: str, snapshot: Snapshot, history: list[dict], notices: str) -> dict:
     return full_state(brief_state(goal, snapshot), history, snapshot.elements[:MAX_CHOICE], notices)
 
@@ -563,7 +593,7 @@ def ask_done(jev: Jev, done_when: str, goal: str, snapshot: Snapshot, history: l
              trigger: str) -> dict:
     """A focused yes/no on the task's evidence, because the 8-way op Choice spreads DONE too thin."""
     state = noul_state(goal, snapshot, history, notices)
-    return {"value": jev.noul(f"Is this true: {done_when.rstrip('.')}?", state), "trigger": trigger}
+    return {"value": jev.noul(truth_question(done_when), state), "trigger": trigger}
 
 
 def noul_decision(value: float, turn: Turn | None = None) -> Decision:
@@ -708,10 +738,11 @@ def missing_required(elements: list[Element]) -> list[str]:
             and e.value.strip() in NO_VALUE]
 
 
-def ask_readiness(jev: Jev, goal: str, snapshot: Snapshot, history: list[dict], notices: str) -> dict:
+def ask_readiness(jev: Jev, goal: str, snapshot: Snapshot, history: list[dict], notices: str, claim: str = "") -> dict:
     """Only informs the human; nothing in the gate branches on it."""
     state = noul_state(goal, snapshot, history, notices)
-    return {"value": jev.noul(READINESS_QUESTION, state), "missing_required": missing_required(snapshot.elements)}
+    question = truth_question(claim) if claim else READINESS_QUESTION
+    return {"value": jev.noul(question, state), "missing_required": missing_required(snapshot.elements)}
 
 
 def readiness_lines(readiness: dict) -> list[str]:
@@ -786,7 +817,7 @@ DEMO_HIDE_JS = "id => document.getElementById(id)?.remove()"
 # Installed before the page loads, so it reaches every frame and survives navigation. Text patterns
 # do most of the work: they don't depend on the console's markup, which the menu selectors do.
 DEMO_PRIVACY_JS = r"""(() => {
-  const SECRET = /arn:aws[\w-]*:|\b\d{4}-\d{4}-\d{4}\b|\b\d{12}\b/;
+  const SECRET = /arn:aws[\w-]*:|\b\d{4}-\d{4}-\d{4}\b|\b\d{12}\b|[\w.+-]+@[\w-]+\.[\w.-]+/;
   const MENU = '#nav-usernameMenu,[data-testid="awsc-nav-account-menu-button"],' +
     '[data-testid="awsc-copy-accountid"],#menu--account';
   const BLUR = 'blur(8px)';
@@ -901,7 +932,7 @@ class RunLog:
         ms = record["latency_ms"]
         print(f"step {record['step']:02d} {record['op']['choice']} {record['target_row']} "
               f"conf={record['confidence']:.2f} source={record['source']} gate={record['gate']} "
-              f"{record['result']} settle={record['settle_ms']:.0f}ms{' settle_timeout' if record['settle_timeout'] else ''} "
+              f"{record['result']} settle={record['settle_ms']:.0f}ms{'' if record['settle_reason'] == 'stable' else ' ' + record['settle_reason']} "
               f"{'noul={value:.2f}({trigger}) '.format(**record['noul_done']) if record['noul_done'] else ''}"
               f"observe={ms['observe']:.0f}ms jev={ms['jev']:.0f}ms act={ms['act']:.0f}ms")
 
@@ -926,6 +957,7 @@ class Limits:
     dry_run: bool = False
     ungated_labels: tuple[str, ...] = ()
     demo: bool = False
+    ready_when_commit: str = ""
 
 
 def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLog, limits: Limits,
@@ -985,7 +1017,7 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
         if not stop and not exempt and needs_gate(decision):
             gate_screenshot = capture(page, log.dir / f"step_{step:02d}_gate.png", full_page=True)
             tick = time.perf_counter()
-            readiness = ask_readiness(jev, goal, snapshot, history, notices)
+            readiness = ask_readiness(jev, goal, snapshot, history, notices, limits.ready_when_commit)
             jev_ms += (time.perf_counter() - tick) * 1000
         waiting = limits.demo and readiness is not None and not limits.dry_run
         if waiting:
@@ -1025,6 +1057,9 @@ def run_loop(page: Page, jev: Jev, goal: str, inputs: dict[str, str], log: RunLo
                   "human_target": human_target, "page_notices": notices, "open_panel": snapshot.open_panel, "noul_done": noul_done,
                   "readiness": readiness, "input": decision.input_key, "confidence": decision.confidence, "source": decision.source,
                   "gate": gate_result, "result": result, "settle_ms": settle_ms, "settle_timeout": settle_timeout,
+                  "settle_reason": ("timeout" if settle_timeout else
+                                    "stuck_indicator_ignored" if snapshot.stuck_indicators else "stable"),
+                  "stuck_indicators": snapshot.stuck_indicators,
                   "latency_ms": {"observe": snapshot.ms, "jev": jev_ms, "act": act_ms},
                   "screenshot": screenshot, "gate_screenshot": gate_screenshot, "model": jev.model,
                   "usage_cost": jev.take_cost()})
@@ -1090,11 +1125,11 @@ def run_task(task_id: str, dry_run: bool = False, ask: Callable[[str], str] = in
         return 2
 
     run_id = verify.new_run_id()
-    goal, inputs, done_when = task.render(run_id)
+    goal, inputs, done_when, ready_when_commit = task.render(run_id)
     log = RunLog(run_id)
     check = verify.CHECKS[task.verifier]
     threshold = float(os.environ.get("JEV_CONFIDENCE_THRESHOLD", "0.7"))
-    limits = Limits(task.max_steps, threshold, dry_run, tuple(task.ungated_labels), demo)
+    limits = Limits(task.max_steps, threshold, dry_run, tuple(task.ungated_labels), demo, ready_when_commit)
     started_at, started = datetime.now(timezone.utc), time.monotonic()
     outcome, passed, teardown_result = Outcome("error"), None, []
     print(f"Run {run_id}: {task.id}{' (dry run)' if dry_run else ''}")

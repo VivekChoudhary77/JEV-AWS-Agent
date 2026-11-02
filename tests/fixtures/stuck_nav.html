@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head><title>Stuck nav</title></head>
+<body>
+  <header><div aria-busy="true" style="width: 20px; height: 20px"></div></header>
+  <nav>
+    <a href="/one">Budgets</a>
+    <a href="/two">Reports</a>
+    <span class="awsui_root_1612d_vxp9i_43" style="display: inline-block; width: 20px; height: 20px"></span>
+  </nav>
+  <main id="main"></main>
+  <footer><div role="progressbar" style="width: 20px; height: 20px"></div></footer>
+  <script>
+    if (new URLSearchParams(location.search).has("chart"))
+      document.getElementById("main").insertAdjacentHTML("afterbegin",
+        '<div id="chart" aria-busy="true" style="width: 100px; height: 40px">Loading cost data</div>');
+    setTimeout(() => document.getElementById("main").insertAdjacentHTML("beforeend", `
+      <label>Budget name <input></label>
+      <button>Next</button>
+      <button>Cancel</button>
+      <button>Help</button>`), 300);
+  </script>
+</body>
+</html>

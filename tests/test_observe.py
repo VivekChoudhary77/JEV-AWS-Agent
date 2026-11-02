@@ -254,11 +254,33 @@ def test_settle_waits_for_aria_busy_to_clear(page, base_url, monkeypatch):
 
 @pytest.mark.parametrize("kind, loading", [
     ("busy", True), ("progressbar", True), ("progress", True), ("spinner", True), ("status", True),
-    ("idle", False), ("hidden", False), ("finished", False), ("in_progress", False),
+    ("main_header", True), ("idle", False), ("hidden", False), ("finished", False), ("in_progress", False),
+    ("nav", False), ("role_nav", False), ("header", False), ("banner", False), ("footer", False),
+    ("console_shell", False),
 ])
 def test_observe_reports_loading_indicators(page, base_url, kind, loading):
     page.goto(f"{base_url}/loading.html?kind={kind}")
     assert agent.observe(page).loading is loading
+
+
+def test_a_permanent_spinner_in_the_nav_doesnt_hold_up_a_form_that_loads_normally(page, base_url, monkeypatch):
+    monkeypatch.setattr(agent, "blocked_reason", lambda url: None)
+    page.goto(f"{base_url}/stuck_nav.html")
+    snapshot, ms, timed_out = agent.settle(page)
+    assert "Budget name" in names(snapshot)
+    assert not timed_out
+    assert ms < agent.STUCK_INDICATOR_S * 1000  # excluded outright, not merely timed out as stuck
+    assert snapshot.indicators == [] and snapshot.stuck_indicators == []
+
+
+def test_a_stuck_indicator_in_the_content_is_ignored_and_named(page, base_url, monkeypatch):
+    monkeypatch.setattr(agent, "blocked_reason", lambda url: None)
+    monkeypatch.setattr(agent, "STUCK_INDICATOR_S", 0.4)
+    page.goto(f"{base_url}/stuck_nav.html?chart=1")
+    snapshot, ms, timed_out = agent.settle(page)
+    assert not timed_out
+    assert ms < agent.SETTLE_CAP_S * 1000 / 2
+    assert snapshot.stuck_indicators == [{"selector": "div#chart", "text": "Loading cost data"}]
 
 
 def test_a_loading_indicator_that_never_clears_times_out(page, base_url, monkeypatch):
@@ -383,12 +405,13 @@ def private_page(page, base_url):
     return page
 
 
-@pytest.mark.parametrize("selector", ["#nav-usernameMenu", "#testid", "#account", "#account-plain", "#arn", "#field"])
+@pytest.mark.parametrize("selector", ["#nav-usernameMenu", "#testid", "#account", "#account-plain", "#arn", "#field",
+                                      "#email"])
 def test_demo_blurs_account_details_and_arns(private_page, selector):
     assert blurred(private_page, selector)
 
 
-@pytest.mark.parametrize("selector", ["#plain", "#short-number", "#hex-id"])
+@pytest.mark.parametrize("selector", ["#plain", "#short-number", "#hex-id", "#at-sign"])
 def test_demo_leaves_ordinary_text_alone(private_page, selector):
     assert not blurred(private_page, selector)
 
@@ -503,8 +526,26 @@ def test_settle_treats_a_navigation_mid_read_as_unsettled(scripted):
     assert len(seen) == 6
 
 
-def loading_table():
-    return agent.Snapshot(ScriptedPage.url, "Title", "", table(6).elements, loading=True)
+def loading_table(text="Loading"):
+    indicators = [{"selector": "div", "text": text}]
+    return agent.Snapshot(ScriptedPage.url, "Title", "", table(6).elements, indicators=indicators)
+
+
+def test_an_unchanged_indicator_stops_blocking_and_is_recorded(scripted, monkeypatch):
+    monkeypatch.setattr(agent, "STUCK_INDICATOR_S", 0)
+    seen = scripted(*[loading_table() for _ in range(5)])
+    snapshot, _, timed_out = agent.settle(ScriptedPage())
+    assert not timed_out
+    assert snapshot.stuck_indicators == [{"selector": "div", "text": "Loading"}]
+    assert len(seen) == 4  # one to start the clock, then the three stable ones with it ignored
+
+
+def test_an_indicator_that_keeps_changing_is_never_stuck(scripted, monkeypatch):
+    monkeypatch.setattr(agent, "STUCK_INDICATOR_S", 0)
+    seen = scripted(*[loading_table(f"{n}%") for n in range(5)], table(6), table(6), table(6))
+    snapshot, _, _ = agent.settle(ScriptedPage())
+    assert len(seen) == 8
+    assert not snapshot.stuck_indicators
 
 
 def test_settle_restarts_the_count_once_loading_clears(scripted):

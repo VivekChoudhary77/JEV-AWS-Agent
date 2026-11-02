@@ -40,6 +40,7 @@
     Then click "Create Event Function".
   done_when: 'A banner says "Successfully created the function {function_name}".'
   ready_when: "Function name"
+  ready_when_commit: 'Runtime is {runtime}, execution role is {existing_role_name}, and Function URL auth type is AWS_IAM.'
   ungated_labels: ["Save"]
   start_url: "https://us-east-1.console.aws.amazon.com/lambda/home?region=us-east-1#/create/function"
   inputs:
@@ -59,6 +60,7 @@
     "Select existing security group" and select the security group named default.
     Then click Launch instance.
   done_when: 'A banner says "Successfully initiated launch of instance".'
+  ready_when_commit: 'Name, key pair "Proceed without a key pair", and the default security group are set.'
   start_url: "https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#LaunchInstances:"
   inputs:
     instance_name: "jevagent-{run_id}-ec2"
@@ -73,6 +75,7 @@
     Amazon and model Nova Micro, then Apply. Type "{prompt}" into the prompt box and click
     Run. Finish with DONE once the model's reply appears below the prompt.
   done_when: "A model reply is shown below the prompt, and the Output token count is shown."
+  ready_when_commit: 'The model "Nova Micro" is selected and the prompt box contains "{prompt}".'
   start_url: "https://us-east-1.console.aws.amazon.com/bedrock/home?region=us-east-1#/"
   inputs:
     prompt: "Reply with one word: hello"

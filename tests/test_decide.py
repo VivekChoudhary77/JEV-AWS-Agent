@@ -265,9 +265,9 @@ class Harness:
         monkeypatch.setattr(agent, "act", lambda page, decision: self.acted.append(decision))
 
     def run(self, jev, replies=(), dry_run=False, inputs=INPUTS, max_steps=5, done_when="Reply is shown.",
-            ready_when="", ungated=()):
+            ready_when="", ungated=(), commit_claim=""):
         answers = iter(replies)
-        limits = agent.Limits(max_steps, 0.7, dry_run, tuple(ungated))
+        limits = agent.Limits(max_steps, 0.7, dry_run, tuple(ungated), ready_when_commit=commit_claim)
         return agent.run_loop(self.page, jev, "goal", inputs, self.log, limits, lambda text: next(answers),
                               done_when, ready_when)
 
@@ -719,6 +719,35 @@ def test_demo_flag_is_off_by_default(monkeypatch, argv, demo):
     assert seen["demo"] is demo
 
 
+STUCK = [{"selector": "div#chart", "text": "Loading cost data"}]
+
+
+@pytest.mark.parametrize("timed_out, stuck, reason", [
+    (False, [], "stable"),
+    (True, [], "timeout"),
+    (False, STUCK, "stuck_indicator_ignored"),
+    (True, STUCK, "timeout"),
+])
+def test_settle_reason_is_logged_per_step(monkeypatch, tmp_path, capsys, timed_out, stuck, reason):
+    page = snapshot(element(1))
+    page.stuck_indicators = stuck
+    harness = Harness(monkeypatch, tmp_path, [page])
+    monkeypatch.setattr(agent, "settle", lambda page_: (page, 12.0, timed_out))
+    harness.run(FakeJev(), max_steps=1)
+    record = harness.steps()[0]
+    assert record["settle_reason"] == reason
+    assert record["stuck_indicators"] == stuck
+    assert record["settle_timeout"] is timed_out
+    assert (reason in capsys.readouterr().out) is (reason != "stable")
+
+
+def test_a_missing_ready_element_is_a_timeout_reason(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [snapshot(element(1))])
+    monkeypatch.setattr(agent, "wait_ready", lambda page, name: (15000.0, True))
+    harness.run(FakeJev(), max_steps=1, ready_when="Function name")
+    assert harness.steps()[0]["settle_reason"] == "timeout"
+
+
 def test_ready_when_is_waited_for_once_before_the_first_observation(monkeypatch, tmp_path):
     harness = Harness(monkeypatch, tmp_path, [snapshot(element(1)), snapshot(element(1))])
     waited = []
@@ -1050,6 +1079,50 @@ def test_readiness_lines(value, missing, expected):
 ])
 def test_missing_required(name, value, role, missing):
     assert bool(agent.missing_required([element(1, role, name, value=value)])) is missing
+
+
+def test_ready_when_commit_replaces_the_generic_question(monkeypatch, tmp_path, capsys):
+    harness = Harness(monkeypatch, tmp_path, [commit_page()])
+    jev = commit_jev(noul=0.42)
+    harness.run(jev, replies=["n"], commit_claim='The model "Nova Micro" is selected.')
+    assert jev.nouls[0][0] == 'Is this true: The model "Nova Micro" is selected?'
+    assert not jev.readiness_asks
+    assert WARNING in capsys.readouterr().out
+    assert harness.steps()[0]["readiness"]["value"] == 0.42
+
+
+def test_ready_when_commit_uses_the_usual_state(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [commit_page()])
+    jev = commit_jev()
+    harness.run(jev, replies=["n"], commit_claim="It is set.")
+    assert jev.nouls[0][1].keys() == {"goal", "url", "title", "last_actions", "elements"}
+
+
+def test_ready_when_commit_still_never_approves(monkeypatch, tmp_path):
+    harness = Harness(monkeypatch, tmp_path, [commit_page()])
+    outcome = harness.run(commit_jev(noul=1.0), replies=["n"], commit_claim="It is set.")
+    assert outcome.status == "denied"
+    assert not harness.acted
+
+
+def test_empty_required_fields_still_warn_with_ready_when_commit(monkeypatch, tmp_path, capsys):
+    harness = Harness(monkeypatch, tmp_path, [commit_page(empty_required())])
+    harness.run(commit_jev(1, noul=0.99), replies=["n"], commit_claim="It is set.")
+    assert "Required with no value" in capsys.readouterr().out
+
+
+def test_run_task_passes_the_rendered_claim_to_the_loop(monkeypatch, tmp_path):
+    fake_run(monkeypatch, tmp_path, agent.verify.Check(lambda run_id, ctx: agent.verify.VerifyResult(True, "ok")))
+    monkeypatch.setitem(agent.verify.CHECKS, "bedrock_prompt", agent.verify.CHECKS["create_budget"])
+    seen = {}
+
+    def drive(task, goal, inputs, done_when, log, limits, cdp_url, ask):
+        seen["claim"] = limits.ready_when_commit
+        return agent.Outcome("done", snapshot(element(1)))
+
+    monkeypatch.setattr(agent, "drive", drive)
+    agent.run_task("05_bedrock_playground_prompt")
+    assert seen["claim"] == 'The model "Nova Micro" is selected and the prompt box contains "Reply with one word: hello".'
 
 
 def test_a_ready_form_shows_the_score_before_the_prompt(monkeypatch, tmp_path, capsys):

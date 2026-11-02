@@ -22,6 +22,13 @@
       spinner: `<span class="awsui_root_1612d_vxp9i_43" ${size}></span>`,
       status: `<span class="awsui_status-loading_1cbgc_19apy_93" ${size}></span>`,
       in_progress: `<span class="awsui_status-in-progress_1cbgc_19apy_90" ${size}></span>`,
+      nav: `<nav><span class="awsui_root_1612d_vxp9i_43" ${size}></span></nav>`,
+      role_nav: `<div role="navigation"><div aria-busy="true" ${size}></div></div>`,
+      header: `<header><div role="progressbar" ${size}></div></header>`,
+      banner: `<div role="banner"><div aria-busy="true" ${size}></div></div>`,
+      footer: `<footer><div aria-busy="true" ${size}></div></footer>`,
+      console_shell: `<div id="awsc-nav-header"><div aria-busy="true" ${size}></div></div>`,
+      main_header: `<main><header><div aria-busy="true" ${size}></div></header></main>`,
     }[params.get("kind")];
     const clearAfter = Number(params.get("clear"));
     if (clearAfter) setTimeout(() => document.getElementById("slot").replaceChildren(), clearAfter);
